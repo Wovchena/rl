@@ -16,7 +16,7 @@ import itertools
 
 
 class Memory:
-    def __init__(self, size=100000, device='cpu'):
+    def __init__(self, size=1e+5, device='cpu'):
         self.size = size
         self.pointer = 0
         self.mem = []
@@ -34,7 +34,7 @@ class Memory:
 
     def batch(self, batch_size):
         batch = random.sample(self.mem, min(len(self.mem), batch_size))
-        batch = [*zip(*batch)]
+        batch = tuple(zip(*batch))
         states = torch.tensor(batch[0], dtype=torch.float32, device=self.device)
         actions = torch.tensor(batch[1], dtype=torch.int64, device=self.device)
         rewards = torch.tensor(batch[2], dtype=torch.float32, device=self.device)
@@ -68,39 +68,20 @@ def visualize(checkpoint_name):
     with torch.no_grad():
         for session_idx in itertools.count():
             observation = env.reset()
-            for step_idx in range(1000):
+            for step_idx in range(2000):
                 env.render()
-                q_values = action_state_value_func(torch.tensor([observation], dtype=torch.float32, device=DEVICE))
-                print(step_idx, q_values)
-                _, best_action = q_values.max(1)
-                next_observation, reward, done, diagnostic_info = env.step(best_action.item())
+                if random.random() < 0.:
+                    action = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        q_values = action_state_value_func(torch.tensor([observation], dtype=torch.float32, device=DEVICE))
+                        print(step_idx, q_values)
+                        _, best_action = q_values.max(1)
+                        action = best_action.item()
+                next_observation, reward, done, diagnostic_info = env.step(action)
                 if done:
                     break
                 observation = next_observation
-
-
-def test(action_state_value_func, device='cpu'):
-    with torch.no_grad():
-        env = gym.make('CartPole-v1').env
-        action_state_value_func.eval()
-        sum_return_G_test = 0
-        # hist = []
-        for session_idx_test in range(50):
-            observation = env.reset()
-            for step_idx in range(1000):
-                q_values = action_state_value_func(torch.tensor([observation], dtype=torch.float32, device=device))
-                _, best_action = q_values.max(1)
-                # if 49 == session_idx_test:
-                #     hist.append(q_values)
-                next_observation, reward, done, diagnostic_info = env.step(best_action.item())
-                sum_return_G_test += reward
-                if done:
-                    break
-                observation = next_observation
-        # if hist:
-        #     print(hist)
-        action_state_value_func.train()
-        return sum_return_G_test / 50
 
 
 
@@ -108,50 +89,20 @@ def main():
     DEVICE = 'cpu'
     BATCH_SIZE = 1000
     mem = Memory()
-    GAMMA = 0.5
+    GAMMA = torch.tensor(0.5, dtype=torch.float32, device=DEVICE)
     env = gym.make('CartPole-v1').env
     n_actions = env.action_space.n
     state_dim = env.observation_space.shape
     action_state_value_func = define_network(state_dim[0], n_actions).to(DEVICE)
-    optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=1e-4)
     epsilon = 0.4
     summary_writer = tensorboardX.SummaryWriter('logs/{:%d-%m-%Y %H-%M}'.format(datetime.datetime.now()))
-    sum_of_reward_sum = 0
-    session_count_for_sum_of_sum = 0
-    global_step_idx = 0
-    gradient_step_cout = 0
-
-    while True:
-        reward_sum = 0
+    sum_return_G = 0
+    for session_idx in itertools.count():
+        return_G = 0
         observation = env.reset()
-        while True:
-            if (global_step_idx-1) % BATCH_SIZE == 0:
-                gradient_step_cout += 1
-                states, actions, rewards, next_states, dones = mem.batch(BATCH_SIZE)
-                with torch.no_grad():
-                    next_values, _ = action_state_value_func(next_states).max(1)
-                    dones = 1 - dones
-                    values = torch.tensor(GAMMA, dtype=torch.float32, device=DEVICE) * dones * next_values + rewards
-                chosen_q_values = action_state_value_func(states).gather(1, actions.unsqueeze(1))
-                loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-
-                if (gradient_step_cout-1) % 100 == 0 and session_count_for_sum_of_sum != 0:
-                    epsilon *= 0.999 if epsilon > 1e-3 else epsilon
-                    summary_writer.add_scalar('return_G', sum_of_reward_sum / session_count_for_sum_of_sum,
-                                              gradient_step_cout // 100)
-                    print(sum_of_reward_sum / session_count_for_sum_of_sum, gradient_step_cout // 100)
-                    sum_of_reward_sum = 0
-                    session_count_for_sum_of_sum = 0
-
-                    # if gradient_step_cout % 1000 == 0:
-                    #     torch.save(action_state_value_func.state_dict(), f'{gradient_step_cout // 100}.pt')
-
-                    sum_reward_test = test(action_state_value_func)
-                    summary_writer.add_scalar('return_G_Test', sum_reward_test, gradient_step_cout // 100)
-
+        for step_idx in range(1000):
+            # env.render()
             if random.random() < epsilon:
                 action = env.action_space.sample()
             else:
@@ -161,15 +112,55 @@ def main():
                     action = best_action.item()
             next_observation, reward, done, diagnostic_info = env.step(action)
             mem.add((observation, action, reward, next_observation, done))
-            global_step_idx += 1
-            reward_sum += reward
+
+            return_G += reward
             if done:
-                sum_of_reward_sum += reward_sum
-                session_count_for_sum_of_sum += 1
                 break
             observation = next_observation
+        sum_return_G += return_G
+        states, actions, rewards, next_states, dones = mem.batch(BATCH_SIZE)
+        with torch.no_grad():
+            next_values, _ = action_state_value_func(next_states).max(1)
+            dones = 1 - dones
+            values = GAMMA * dones * next_values + rewards
+        chosen_q_values = action_state_value_func(states).gather(1, actions.unsqueeze(1))
+        loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if (session_idx + 1) % 100 == 0:
+            print((session_idx + 1) // 100, sum_return_G / 100, epsilon)
+            summary_writer.add_scalar('return_G', sum_return_G / 100, session_idx // 100)
+            sum_return_G = 0
+            if epsilon > 1e-3:
+                epsilon *= 0.999
+            with torch.no_grad():
+                action_state_value_func.eval()
+                sum_return_G_test = 0
+                # hist = []
+                for session_idx_test in range(30):
+                    observation = env.reset()
+                    for step_idx in range(1000):
+                        q_values = action_state_value_func(torch.tensor([observation], dtype=torch.float32,
+                                                                        device=DEVICE))
+                        _, best_action = q_values.max(1)
+                        # if 29 == session_idx_test:
+                        #     hist.append(q_values)
+                        next_observation, reward, done, diagnostic_info = env.step(best_action.item())
+                        sum_return_G_test += reward
+                        if done:
+                            break
+                        observation = next_observation
+                # if hist:
+                #     print(hist)
+                action_state_value_func.train()
+            # print(sum_return_G_test / 30)
+            summary_writer.add_scalar('return_G_Test', sum_return_G_test / 30, session_idx // 100)
+            if (session_idx + 1) % 2500 == 0:
+                torch.save(action_state_value_func.state_dict(), f'{session_idx // 100}.pt')
 
 
 if __name__ == '__main__':
     main()
-    # visualize(sys.argv[1] + '99.pt')
+    # visualize(sys.argv[1] + '9.pt')

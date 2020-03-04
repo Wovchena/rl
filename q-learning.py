@@ -1,10 +1,9 @@
 import gym
-import gym.spaces
-import gym.wrappers
+from gym.envs import classic_control
+
 import numpy as np
 
 import random
-import sys
 
 import torch
 import torch.nn as nn
@@ -16,21 +15,22 @@ import itertools
 
 
 class Memory:
-    def __init__(self, size=1e+5, device='cpu'):
+    def __init__(self, size, device):
         self.size = size
         self.pointer = 0
         self.mem = []
         self.device = device
 
-    def add(self, sarsd):
-        if len(self.mem) <= self.size:
-            self.mem.append(sarsd)
-        else:
-            self.mem[self.pointer] = sarsd
-            if self.pointer >= self.size:
-                self.pointer = 0
+    def add(self, states, actions, rewards, next_states, dones):
+        for idx in range(len(states)):
+            if len(self.mem) <= self.size:
+                self.mem.append((states[idx], actions[idx], rewards[idx], next_states[idx], dones[idx]))
             else:
-                self.pointer += 1
+                self.mem[self.pointer] = (states[idx], actions[idx], rewards[idx], next_states[idx], dones[idx])
+                if self.pointer >= self.size:
+                    self.pointer = 0
+                else:
+                    self.pointer += 1
 
     def batch(self, batch_size):
         batch = random.sample(self.mem, min(len(self.mem), batch_size))
@@ -59,7 +59,7 @@ def define_network(state_dim, n_actions):
 
 def visualize(checkpoint_name):
     DEVICE = 'cpu'
-    env = gym.make('CartPole-v1').env
+    env = classic_control.CartPoleEnv()
     n_actions = env.action_space.n
     state_dim = env.observation_space.shape
     action_state_value_func = define_network(state_dim[0], n_actions).to(DEVICE)
@@ -84,20 +84,89 @@ def visualize(checkpoint_name):
                 observation = next_observation
 
 
+class RenderWrapper(gym.Wrapper):
+    def step(self, action):
+        super().render()
+        return super().step(action)
+
+
+def env_fn():
+    return classic_control.CartPoleEnv()
+
 
 def main():
     DEVICE = 'cpu'
-    BATCH_SIZE = 1000
-    mem = Memory()
+    ENV_NUM = 45  # TODO 1
+    BATCH_SIZE = 100  # TODO 1000
+    START_EPSILON = 0.3  # TODO 0.4
+    MIN_EPSILON = 0.01  # TODO 1e-3
+    EPSILON_DECAY = 0.99999  # TODO 0.999 * 1000
     GAMMA = torch.tensor(0.5, dtype=torch.float32, device=DEVICE)
-    env = gym.make('CartPole-v1').env
-    n_actions = env.action_space.n
-    state_dim = env.observation_space.shape
-    action_state_value_func = define_network(state_dim[0], n_actions).to(DEVICE)
-    optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=1e-4)
-    epsilon = 0.4
-    summary_writer = tensorboardX.SummaryWriter('logs/{:%d-%m-%Y %H-%M}'.format(datetime.datetime.now()))
-    sum_return_G = 0
+    LEARNING_RATE = 1e-4
+    REPLAY_MEMORY_SIZE = 100000
+    mem = Memory(REPLAY_MEMORY_SIZE, DEVICE)
+    env = gym.vector.async_vector_env.AsyncVectorEnv((lambda: RenderWrapper(env_fn()),)+(env_fn,)*(ENV_NUM-1))
+    action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
+    optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
+    epsilon = START_EPSILON
+    current_total_rewards = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
+    sum_total_rewards = 0.0
+    count_sum_total_rewards = 0
+    observations = env.reset()
+    experiment_Name = 'logs/{:%d-%m-%Y %H-%M}'.format(datetime.datetime.now())
+    hparam_dict = {'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON, 'epsDecay': EPSILON_DECAY,
+                   'gamma': GAMMA.item(), 'lr': LEARNING_RATE, 'memSize': REPLAY_MEMORY_SIZE}
+    for step_idx in itertools.count():
+        if random.random() < epsilon:
+            actions = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                q_values = action_state_value_func(torch.tensor(observations, dtype=torch.float32, device=DEVICE))
+            actions = q_values.argmax(1).cpu().numpy()  # gym doesn't know PyTorch
+        next_observations, rewards, dones, diagnostic_infos = env.step(actions)
+        mem.add(observations, actions, rewards, next_observations, dones)
+
+        # record stats
+        current_total_rewards += rewards
+        number_of_dones = dones.sum()
+        if number_of_dones:  # sum_total_rewards += current_total_rewards[dones].sum() will result in nan otherwise
+            sum_total_rewards += current_total_rewards[dones].sum()
+            count_sum_total_rewards += number_of_dones
+            current_total_rewards[dones] = 0.0
+        if step_idx != 0 and count_sum_total_rewards != 0 and step_idx % 100 == 0:
+            with tensorboardX.SummaryWriter(experiment_Name) as summary_writer:
+                summary_writer.add_hparams(hparam_dict=hparam_dict,
+                                           metric_dict={'totalReward': sum_total_rewards/count_sum_total_rewards,
+                                                        'epsilon': epsilon},
+                                           name='a', global_step=step_idx//100)
+            sum_total_rewards = 0.0
+            count_sum_total_rewards = 0
+
+        # finalize step
+        observations = next_observations
+        if epsilon > MIN_EPSILON:
+            epsilon *= EPSILON_DECAY
+
+        # train
+        for train_idx in range(2):
+            states, actions, rewards, next_states, dones = mem.batch(BATCH_SIZE)
+            with torch.no_grad():
+                next_values, _ = action_state_value_func(next_states).max(1)
+            dones = 1 - dones
+            values = GAMMA * dones * next_values + rewards
+            chosen_q_values = action_state_value_func(states).gather(1, actions.unsqueeze(1))
+            loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+
+
+
+
+
+
+
     for session_idx in itertools.count():
         return_G = 0
         observation = env.reset()
@@ -133,7 +202,7 @@ def main():
             print((session_idx + 1) // 100, sum_return_G / 100, epsilon)
             summary_writer.add_scalar('return_G', sum_return_G / 100, session_idx // 100)
             sum_return_G = 0
-            if epsilon > 1e-3:
+            if epsilon > 0.025:
                 epsilon *= 0.999
             with torch.no_grad():
                 action_state_value_func.eval()

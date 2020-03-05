@@ -101,14 +101,8 @@ def env_fn():
         (110, 84)), 1000), 3)
 
 
-def predict_actions(action_state_value_func, observations, device):  # separate scope should save some GPU mem
-    # TODO get device from action_state_value_func
-    with torch.no_grad():
-        q_values = action_state_value_func(torch.tensor(observations, dtype=torch.float32, device=device))
-    return q_values.argmax(1).cpu().numpy()  # gym doesn't know PyTorch
-
-
 def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
+    optimizer.zero_grad()
     states, actions, rewards, next_states, dones = mem.batch(batch_size)
     with torch.no_grad():
         next_values, _ = action_state_value_func(next_states).max(1)
@@ -117,13 +111,12 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
     loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
     loss.backward()
     optimizer.step()
-    optimizer.zero_grad()
 
 
 def main():
     DEVICE = 'cuda'
-    ENV_NUM = 2
-    BATCH_SIZE = 2
+    ENV_NUM = 20
+    BATCH_SIZE = 100
     START_EPSILON = 0.5
     MIN_EPSILON = 0.001
     EPSILON_DECAY = 0.9999
@@ -135,26 +128,29 @@ def main():
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
     action_state_value_func = ConvQN(9, env.action_space[0].n).to(DEVICE)
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
-    optimizer.zero_grad()
     epsilon = START_EPSILON
     current_total_rewards = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
+    rewards = np.zeros((env.num_envs,), dtype=np.float64)
+    dones = np.zeros((env.num_envs,), dtype=np.bool)
     sum_total_rewards = 0.0
     count_sum_total_rewards = 0
     observations = env.reset()
-    observations = observations.transpose(0, 2, 3, 1, 4).reshape((observations.shape[0], observations.shape[2], observations.shape[3], -1))  # (20, 3, 210, 160, 3)->(20, 210, 160, 9)
-    observations = observations.transpose(0, 3, 1, 2)  # TODO this can be done easier
-    experiment_Name = 'logs/{:%d-%m-%Y %H-%M}'.format(datetime.datetime.now())
+    observations = np.moveaxis(observations, 4, 2).reshape((observations.shape[0], -1, observations.shape[2],
+        observations.shape[3]))  # (20, 3, 110, 84, 3)->(20, 9, 110, 84)
+    experiment_name = 'logs/{:%d-%m-%Y %H-%M}'.format(datetime.datetime.now())
     hparam_dict = {'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON, 'epsDecay': EPSILON_DECAY,
                    'gamma': GAMMA.item(), 'lr': LEARNING_RATE, 'memSize': REPLAY_MEMORY_SIZE}
     for step_idx in itertools.count():
         if random.random() < epsilon:
             actions = env.action_space.sample()
         else:
-            actions = predict_actions(action_state_value_func, observations, DEVICE)
-        next_observations, rewards, dones, diagnostic_infos = env.step(actions)
-        next_observations = next_observations.transpose(0, 2, 3, 1, 4).reshape((next_observations.shape[0], next_observations.shape[2], next_observations.shape[3], -1))  # (20, 3, 210, 160, 3)->(20, 210, 160, 9)
-        next_observations = next_observations.transpose(0, 3, 1, 2)
-        mem.add(observations, actions, rewards, next_observations, dones)
+            with torch.no_grad():
+                actions = action_state_value_func(torch.tensor(observations, dtype=torch.float32, device=DEVICE))
+            actions = actions.argmax(1).cpu().numpy()  # gym doesn't know PyTorch
+        env.step_async(actions)
+
+        if mem.mem:
+            train_step(action_state_value_func, mem, BATCH_SIZE, GAMMA, optimizer)
 
         # record stats
         current_total_rewards += rewards
@@ -163,21 +159,23 @@ def main():
             sum_total_rewards += current_total_rewards[dones].sum()
             count_sum_total_rewards += number_of_dones
             current_total_rewards[dones] = 0.0
-        if step_idx != 0 and count_sum_total_rewards != 0 and step_idx % 10 == 0:
-            with tensorboardX.SummaryWriter(experiment_Name) as summary_writer:
+        if count_sum_total_rewards != 0 and (step_idx - 1) % 100 == 0:  # -1 because of async
+            with tensorboardX.SummaryWriter(experiment_name) as summary_writer:
                 summary_writer.add_hparams(hparam_dict=hparam_dict,
                                            metric_dict={'totalReward': sum_total_rewards/count_sum_total_rewards,
                                                         'epsilon': epsilon},
-                                           name='a', global_step=step_idx//10)
+                                           name='a', global_step=(step_idx - 1)//100)
             sum_total_rewards = 0.0
             count_sum_total_rewards = 0
 
-        # finalize step
-        observations = next_observations
         if epsilon > MIN_EPSILON:
             epsilon *= EPSILON_DECAY
 
-        train_step(action_state_value_func, mem, BATCH_SIZE, GAMMA, optimizer)
+        next_observations, rewards, dones, diagnostic_infos = env.step_wait()
+        next_observations = np.moveaxis(next_observations, 4, 2).reshape((next_observations.shape[0], -1,
+            next_observations.shape[2], next_observations.shape[3]))
+        mem.add(observations, actions, rewards, next_observations, dones)
+        observations = next_observations
 
 
 if __name__ == '__main__':

@@ -65,24 +65,17 @@ def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
         torch.nn.BatchNorm2d(out_features), Swish())
 
 
-class ConvQN(torch.nn.Module):
+class DQN(torch.nn.Module):
     def __init__(self, state_dim, n_actions):
         super().__init__()
-        # like https://storage.googleapis.com/deepmind-media/dqn/DQNNaturePaper.pdf but Swish, not sure about padding
+        # like https://storage.googleapis.com/deepmind-media/dqn/DQNNaturePaper.pdf but Swish, RGB, resize not to square
         self.conv1 = conv(state_dim, 32, kernel_size=8, stride=4, padding=4)
         self.conv2 = conv(32, 64, kernel_size=4, stride=2, padding=2)
         self.conv3 = conv(64, 64)
-        # self.conv1 = conv(state_dim, 32)
-        # self.conv2 = conv(32, 32)
-        # self.conv3 = conv(32, 32)
-        # self.conv4 = conv(32, 64)
-        # self.conv5 = conv(64, 64)
-        # self.conv6 = conv(64, 64)
         self.linear1 = torch.nn.Linear(11520, 512)
         self.linear2 = torch.nn.Linear(512, n_actions)
 
     def forward(self, state):
-        # c1 = self.conv6(self.conv5(self.conv4(torch.nn.functional.max_pool2d(self.conv3(self.conv2(self.conv1(state))), kernel_size=2))))
         c1 = self.conv3(self.conv2(self.conv1(state)))
         fc1 = F.relu(self.linear1(c1.view(c1.shape[0], -1)))
         return self.linear2(fc1)
@@ -97,8 +90,8 @@ class RenderWrapper(gym.Wrapper):
 def env_fn():
     # return gym.wrappers.FlattenObservation(gym.wrappers.FrameStack(gym.wrappers.TimeLimit(gym.envs.classic_control.CartPoleEnv(), 1000), 3))
     return gym.wrappers.FrameStack(gym.wrappers.TimeLimit(gym.wrappers.ResizeObservation(
-        gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=1, repeat_action_probability=0.25),
-        (110, 84)), 1000), 3)
+        gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25),
+        (110, 84)), 1000), 3) # TODO remove TimeLimit, repeat_action_probability
 
 
 def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
@@ -115,18 +108,18 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
 
 def main():
     DEVICE = 'cuda'
-    ENV_NUM = 20
-    BATCH_SIZE = 100
+    ENV_NUM = 4
+    BATCH_SIZE = 32
     START_EPSILON = 0.5
-    MIN_EPSILON = 0.001
-    EPSILON_DECAY = 0.9999
-    GAMMA = torch.tensor(0.5, dtype=torch.float32, device=DEVICE)
+    MIN_EPSILON = 0.01
+    EPSILON_DECAY = 0.99999
+    GAMMA = torch.tensor(0.99, dtype=torch.float32, device=DEVICE)
     LEARNING_RATE = 1e-4
-    REPLAY_MEMORY_SIZE = 5000
+    REPLAY_MEMORY_SIZE = 10**4
     mem = Memory(REPLAY_MEMORY_SIZE, DEVICE)
-    env = gym.vector.async_vector_env.AsyncVectorEnv((lambda: RenderWrapper(env_fn()),)+(env_fn,)*ENV_NUM)
+    env = gym.vector.async_vector_env.AsyncVectorEnv((env_fn,)*ENV_NUM)
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
-    action_state_value_func = ConvQN(9, env.action_space[0].n).to(DEVICE)
+    action_state_value_func = DQN(9, env.action_space[0].n).to(DEVICE)
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
     epsilon = START_EPSILON
     current_total_rewards = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
@@ -146,7 +139,7 @@ def main():
         else:
             with torch.no_grad():
                 actions = action_state_value_func(torch.tensor(observations, dtype=torch.float32, device=DEVICE))
-            actions = actions.argmax(1).cpu().numpy()  # gym doesn't know PyTorch
+            actions = actions.argmax(1).cpu().numpy()
         env.step_async(actions)
 
         if mem.mem:
@@ -180,4 +173,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    # visualize(sys.argv[1] + '9.pt')

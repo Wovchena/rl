@@ -2,6 +2,8 @@ import datetime
 import itertools
 import random
 
+import cv2
+
 import gym
 import gym.envs.atari
 # import gym.envs.classic_control
@@ -68,11 +70,11 @@ def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
 class DQN(torch.nn.Module):
     def __init__(self, state_dim, n_actions):
         super().__init__()
-        # like https://storage.googleapis.com/deepmind-media/dqn/DQNNaturePaper.pdf but Swish, RGB, resize not to square
+        # like https://storage.googleapis.com/deepmind-media/dqn/DQNNaturePaper.pdf but Swish, resize not to square
         self.conv1 = conv(state_dim, 32, kernel_size=8, stride=4, padding=4)
         self.conv2 = conv(32, 64, kernel_size=4, stride=2, padding=2)
         self.conv3 = conv(64, 64)
-        self.linear1 = torch.nn.Linear(11520, 512)
+        self.linear1 = torch.nn.Linear(7680, 512)
         self.linear2 = torch.nn.Linear(512, n_actions)
 
     def forward(self, state):
@@ -83,15 +85,37 @@ class DQN(torch.nn.Module):
 
 class RenderWrapper(gym.Wrapper):
     def step(self, action):
+        observation, reward, done, diagnostic_info = super().step(action)
+        # cv2.imshow("kek", observation[2])
+        # cv2.waitKey(1)
         super().render()
-        return super().step(action)
+        return observation, reward, done, diagnostic_info
+
+
+class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.shape = (84, 75, 1)
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=self.shape, dtype=np.uint8)
+
+    def observation(self, observation):
+        return cv2.resize(cv2.cvtColor(observation[-180:, :160], cv2.COLOR_RGB2GRAY),
+                          (75, 84), interpolation=cv2.INTER_AREA)[:, :, None]
+
+
+class SqueezeWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(3, 84, 75), dtype=np.uint8)
+
+    def observation(self, observation):
+        return np.squeeze(observation, 3)
 
 
 def env_fn():
     # return gym.wrappers.FlattenObservation(gym.wrappers.FrameStack(gym.wrappers.TimeLimit(gym.envs.classic_control.CartPoleEnv(), 1000), 3))
-    return gym.wrappers.FrameStack(gym.wrappers.TimeLimit(gym.wrappers.ResizeObservation(
-        gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25),
-        (110, 84)), 1000), 3) # TODO remove TimeLimit, repeat_action_probability
+    return SqueezeWrapper(gym.wrappers.FrameStack(CropGrayScaleResizeWrapper(
+        gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25)), 3))
 
 
 def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
@@ -99,7 +123,7 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
     states, actions, rewards, next_states, dones = mem.batch(batch_size)
     with torch.no_grad():
         next_values, _ = action_state_value_func(next_states).max(1)
-    values = gamma * (1 - dones) * next_values + rewards
+    values = gamma * (1.0 - dones) * next_values + rewards
     chosen_q_values = action_state_value_func(states).gather(1, actions.unsqueeze(1))
     loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
     loss.backward()
@@ -107,30 +131,29 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
 
 
 def main():
+    # TODO save mean and std over 100 episodes, linear eps decay
     DEVICE = 'cuda'
-    ENV_NUM = 4
+    ENV_NUM = 20
     BATCH_SIZE = 32
-    START_EPSILON = 0.5
-    MIN_EPSILON = 0.01
+    START_EPSILON = 1.0
+    MIN_EPSILON = 0.2
     EPSILON_DECAY = 0.99999
     GAMMA = torch.tensor(0.99, dtype=torch.float32, device=DEVICE)
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-3
     REPLAY_MEMORY_SIZE = 10**4
     mem = Memory(REPLAY_MEMORY_SIZE, DEVICE)
-    env = gym.vector.async_vector_env.AsyncVectorEnv((env_fn,)*ENV_NUM)
+    env = gym.vector.async_vector_env.AsyncVectorEnv((lambda: RenderWrapper(env_fn()),)+(env_fn,)*(ENV_NUM-1))
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
-    action_state_value_func = DQN(9, env.action_space[0].n).to(DEVICE)
+    action_state_value_func = DQN(3, env.action_space[0].n).to(DEVICE)
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
     epsilon = START_EPSILON
-    current_total_rewards = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
+    current_scores = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
     rewards = np.zeros((env.num_envs,), dtype=np.float64)
     dones = np.zeros((env.num_envs,), dtype=np.bool)
-    sum_total_rewards = 0.0
-    count_sum_total_rewards = 0
+    sum_scores = 0.0
+    count_sum_scores = 0
     observations = env.reset()
-    observations = np.moveaxis(observations, 4, 2).reshape((observations.shape[0], -1, observations.shape[2],
-        observations.shape[3]))  # (20, 3, 110, 84, 3)->(20, 9, 110, 84)
-    experiment_name = 'logs/{:%d-%m-%Y %H-%M}'.format(datetime.datetime.now())
+    experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
     hparam_dict = {'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON, 'epsDecay': EPSILON_DECAY,
                    'gamma': GAMMA.item(), 'lr': LEARNING_RATE, 'memSize': REPLAY_MEMORY_SIZE}
     for step_idx in itertools.count():
@@ -142,31 +165,29 @@ def main():
             actions = actions.argmax(1).cpu().numpy()
         env.step_async(actions)
 
-        if mem.mem:
+        if mem.mem and step_idx > 150:
             train_step(action_state_value_func, mem, BATCH_SIZE, GAMMA, optimizer)
 
         # record stats
-        current_total_rewards += rewards
+        current_scores += rewards
         number_of_dones = dones.sum()
-        if number_of_dones:  # sum_total_rewards += current_total_rewards[dones].sum() will result in nan otherwise
-            sum_total_rewards += current_total_rewards[dones].sum()
-            count_sum_total_rewards += number_of_dones
-            current_total_rewards[dones] = 0.0
-        if count_sum_total_rewards != 0 and (step_idx - 1) % 100 == 0:  # -1 because of async
+        if number_of_dones:  # sum_total_rewascores += current_scores[dones].sum() will result in nan otherwise
+            sum_scores += current_scores[dones].sum()
+            count_sum_scores += number_of_dones
+            current_scores[dones] = 0.0
+        if count_sum_scores != 0 and (step_idx - 1) % 100 == 0:  # -1 because of async
             with tensorboardX.SummaryWriter(experiment_name) as summary_writer:
                 summary_writer.add_hparams(hparam_dict=hparam_dict,
-                                           metric_dict={'totalReward': sum_total_rewards/count_sum_total_rewards,
+                                           metric_dict={'totalReward': sum_scores/count_sum_scores,
                                                         'epsilon': epsilon},
                                            name='a', global_step=(step_idx - 1)//100)
-            sum_total_rewards = 0.0
-            count_sum_total_rewards = 0
+            sum_scores = 0.0
+            count_sum_scores = 0
 
         if epsilon > MIN_EPSILON:
             epsilon *= EPSILON_DECAY
 
         next_observations, rewards, dones, diagnostic_infos = env.step_wait()
-        next_observations = np.moveaxis(next_observations, 4, 2).reshape((next_observations.shape[0], -1,
-            next_observations.shape[2], next_observations.shape[3]))
         mem.add(observations, actions, rewards, next_observations, dones)
         observations = next_observations
 

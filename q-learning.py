@@ -131,16 +131,16 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
 
 
 def main():
-    # TODO save mean and std over 100 episodes, linear eps decay
+    # TODO report predicted q-values
     DEVICE = 'cuda'
-    ENV_NUM = 20
+    ENV_NUM = 10
     BATCH_SIZE = 32
-    START_EPSILON = 1.0
-    MIN_EPSILON = 0.2
-    EPSILON_DECAY = 0.99999
+    START_EPSILON = 0.8
+    MIN_EPSILON = 0.1
+    STOP_EPSILON_DECAY_AT = 4*10**6
     GAMMA = torch.tensor(0.99, dtype=torch.float32, device=DEVICE)
     LEARNING_RATE = 1e-3
-    REPLAY_MEMORY_SIZE = 10**4
+    REPLAY_MEMORY_SIZE = 5000
     mem = Memory(REPLAY_MEMORY_SIZE, DEVICE)
     env = gym.vector.async_vector_env.AsyncVectorEnv((lambda: RenderWrapper(env_fn()),)+(env_fn,)*(ENV_NUM-1))
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
@@ -150,12 +150,13 @@ def main():
     current_scores = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
     rewards = np.zeros((env.num_envs,), dtype=np.float64)
     dones = np.zeros((env.num_envs,), dtype=np.bool)
-    sum_scores = 0.0
-    count_sum_scores = 0
+    last_scores = []
     observations = env.reset()
     experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
-    hparam_dict = {'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON, 'epsDecay': EPSILON_DECAY,
-                   'gamma': GAMMA.item(), 'lr': LEARNING_RATE, 'memSize': REPLAY_MEMORY_SIZE}
+    summary_writer = tensorboardX.SummaryWriter(experiment_name)
+    summary_writer.add_hparams({'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON,
+        'stopEpsDecayAt': STOP_EPSILON_DECAY_AT, 'gamma': GAMMA.item(), 'lr': LEARNING_RATE,
+        'memSize': REPLAY_MEMORY_SIZE}, {}, 'hparams')
     for step_idx in itertools.count():
         if random.random() < epsilon:
             actions = env.action_space.sample()
@@ -171,21 +172,18 @@ def main():
         # record stats
         current_scores += rewards
         number_of_dones = dones.sum()
-        if number_of_dones:  # sum_total_rewascores += current_scores[dones].sum() will result in nan otherwise
-            sum_scores += current_scores[dones].sum()
-            count_sum_scores += number_of_dones
+        if number_of_dones:
+            last_scores.extend(current_scores[dones])
+            summary_writer.add_scalar('score', current_scores[dones].sum() / number_of_dones, step_idx)
+            summary_writer.add_scalar('epsilon', epsilon, step_idx)
+            if len(last_scores) > 100:
+                summary_writer.add_scalar('mean score', np.mean(last_scores), step_idx)
+                summary_writer.add_scalar('std score', np.std(last_scores), step_idx)
+                last_scores = []
             current_scores[dones] = 0.0
-        if count_sum_scores != 0 and (step_idx - 1) % 100 == 0:  # -1 because of async
-            with tensorboardX.SummaryWriter(experiment_name) as summary_writer:
-                summary_writer.add_hparams(hparam_dict=hparam_dict,
-                                           metric_dict={'totalReward': sum_scores/count_sum_scores,
-                                                        'epsilon': epsilon},
-                                           name='a', global_step=(step_idx - 1)//100)
-            sum_scores = 0.0
-            count_sum_scores = 0
 
         if epsilon > MIN_EPSILON:
-            epsilon *= EPSILON_DECAY
+            epsilon -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
 
         next_observations, rewards, dones, diagnostic_infos = env.step_wait()
         mem.add(observations, actions, rewards, next_observations, dones)

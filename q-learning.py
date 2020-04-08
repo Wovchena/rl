@@ -73,7 +73,7 @@ class DQN(torch.nn.Module):
         # like https://storage.googleapis.com/deepmind-media/dqn/DQNNaturePaper.pdf but Swish, resize not to square
         self.conv1 = conv(state_dim, 32, kernel_size=8, stride=4, padding=4)
         self.conv2 = conv(32, 64, kernel_size=4, stride=2, padding=2)
-        self.conv3 = conv(64, 64)
+        self.conv3 = conv(64, 64)  # TODO: trainable leaky RelU, no batchNorm
         self.linear1 = torch.nn.Linear(7680, 512)
         self.linear2 = torch.nn.Linear(512, n_actions)
 
@@ -106,7 +106,7 @@ class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
 class SqueezeWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(3, 84, 75), dtype=np.uint8)
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(4, 84, 75), dtype=np.uint8)
 
     def observation(self, observation):
         return np.squeeze(observation, 3)
@@ -114,8 +114,15 @@ class SqueezeWrapper(gym.ObservationWrapper):
 
 def env_fn():
     # return gym.wrappers.FlattenObservation(gym.wrappers.FrameStack(gym.wrappers.TimeLimit(gym.envs.classic_control.CartPoleEnv(), 1000), 3))
-    return SqueezeWrapper(gym.wrappers.FrameStack(CropGrayScaleResizeWrapper(
-        gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25)), 3))
+    return SqueezeWrapper(
+        gym.wrappers.FrameStack(
+            CropGrayScaleResizeWrapper(
+                gym.wrappers.TimeLimit(
+                    gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25),
+                    60000),
+            ),
+            4)
+        )
 
 
 def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
@@ -131,20 +138,20 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
 
 
 def main():
-    # TODO report predicted q-values
+    # TODO report predicted q-values, mem could manage frame stacking
     DEVICE = 'cuda'
-    ENV_NUM = 10
-    BATCH_SIZE = 32
-    START_EPSILON = 0.8
+    ENV_NUM = 4
+    BATCH_SIZE = 64
+    START_EPSILON = 1.0
     MIN_EPSILON = 0.1
-    STOP_EPSILON_DECAY_AT = 4*10**6
+    STOP_EPSILON_DECAY_AT = 10**6
     GAMMA = torch.tensor(0.99, dtype=torch.float32, device=DEVICE)
     LEARNING_RATE = 1e-3
-    REPLAY_MEMORY_SIZE = 5000
+    REPLAY_MEMORY_SIZE = 5000  # TODO: 10**6
     mem = Memory(REPLAY_MEMORY_SIZE, DEVICE)
     env = gym.vector.async_vector_env.AsyncVectorEnv((lambda: RenderWrapper(env_fn()),)+(env_fn,)*(ENV_NUM-1))
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
-    action_state_value_func = DQN(3, env.action_space[0].n).to(DEVICE)
+    action_state_value_func = DQN(4, env.action_space[0].n).to(DEVICE)
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
     epsilon = START_EPSILON
     current_scores = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
@@ -153,6 +160,13 @@ def main():
     last_scores = []
     observations = env.reset()
     experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
+
+    for step_idx in range(REPLAY_MEMORY_SIZE // 20):
+        actions = env.action_space.sample()
+        next_observations, rewards, dones, diagnostic_infos = env.step(actions)
+        mem.add(observations, actions, rewards, next_observations, dones)
+        observations = next_observations
+
     summary_writer = tensorboardX.SummaryWriter(experiment_name)
     summary_writer.add_hparams({'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON,
         'stopEpsDecayAt': STOP_EPSILON_DECAY_AT, 'gamma': GAMMA.item(), 'lr': LEARNING_RATE,
@@ -166,8 +180,7 @@ def main():
             actions = actions.argmax(1).cpu().numpy()
         env.step_async(actions)
 
-        if mem.mem and step_idx > 150:
-            train_step(action_state_value_func, mem, BATCH_SIZE, GAMMA, optimizer)
+        train_step(action_state_value_func, mem, BATCH_SIZE, GAMMA, optimizer)
 
         # record stats
         current_scores += rewards

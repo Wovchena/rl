@@ -17,6 +17,8 @@ import torch.nn.functional as F
 
 import tensorboardX
 
+import expreplay
+
 
 class Memory:
     def __init__(self, size, device):
@@ -95,12 +97,12 @@ class RenderWrapper(gym.Wrapper):
 class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.shape = (84, 75, 1)
+        self.shape = (84, 75)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=self.shape, dtype=np.uint8)
 
     def observation(self, observation):
         return cv2.resize(cv2.cvtColor(observation[-180:, :160], cv2.COLOR_RGB2GRAY),
-                          (75, 84), interpolation=cv2.INTER_AREA)[:, :, None]
+                          (75, 84), interpolation=cv2.INTER_AREA)
 
 
 class SqueezeWrapper(gym.ObservationWrapper):
@@ -138,7 +140,7 @@ def train_step(action_state_value_func, mem, batch_size, gamma, optimizer):
 
 
 def main():
-    # TODO report predicted q-values, mem could manage frame stacking
+    # TODO report predicted q-values
     DEVICE = 'cuda'
     ENV_NUM = 4
     BATCH_SIZE = 64
@@ -147,60 +149,54 @@ def main():
     STOP_EPSILON_DECAY_AT = 10**6
     GAMMA = torch.tensor(0.99, dtype=torch.float32, device=DEVICE)
     LEARNING_RATE = 1e-3
-    REPLAY_MEMORY_SIZE = 5000  # TODO: 10**6
-    mem = Memory(REPLAY_MEMORY_SIZE, DEVICE)
-    env = gym.vector.async_vector_env.AsyncVectorEnv((lambda: RenderWrapper(env_fn()),)+(env_fn,)*(ENV_NUM-1))
+    REPLAY_MEMORY_SIZE = 10**6
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
-    action_state_value_func = DQN(4, env.action_space[0].n).to(DEVICE)
+    action_state_value_func = DQN(4, 4).to(DEVICE)
+    def predictor(history):
+        with torch.no_grad():
+            return action_state_value_func(
+                torch.tensor(np.moveaxis(history, 3, 1), dtype=torch.float32, device=DEVICE)).cpu()[None, :, :]
+    exp_replay = expreplay.ExpReplay(predictor,
+                                     lambda: CropGrayScaleResizeWrapper(gym.wrappers.TimeLimit(
+                                         gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4,
+                                                                 repeat_action_probability=0.25), 60000)),
+                                     1,
+                                     (84, 75),
+                                     BATCH_SIZE,
+                                     REPLAY_MEMORY_SIZE, REPLAY_MEMORY_SIZE // 20,
+                                     ENV_NUM, 4,
+                                     state_dtype='uint8')
+    exp_replay._before_train()
+    exp_replay._init_memory()
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
-    epsilon = START_EPSILON
-    current_scores = np.zeros((env.num_envs,), dtype=np.float64)  # VectorEnv returns as np.float64
-    rewards = np.zeros((env.num_envs,), dtype=np.float64)
-    dones = np.zeros((env.num_envs,), dtype=np.bool)
-    last_scores = []
-    observations = env.reset()
+    exp_replay.exploration = START_EPSILON
     experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
-
-    for step_idx in range(REPLAY_MEMORY_SIZE // 20):
-        actions = env.action_space.sample()
-        next_observations, rewards, dones, diagnostic_infos = env.step(actions)
-        mem.add(observations, actions, rewards, next_observations, dones)
-        observations = next_observations
-
     summary_writer = tensorboardX.SummaryWriter(experiment_name)
     summary_writer.add_hparams({'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON,
         'stopEpsDecayAt': STOP_EPSILON_DECAY_AT, 'gamma': GAMMA.item(), 'lr': LEARNING_RATE,
         'memSize': REPLAY_MEMORY_SIZE}, {}, 'hparams')
-    for step_idx in itertools.count():
-        if random.random() < epsilon:
-            actions = env.action_space.sample()
-        else:
-            with torch.no_grad():
-                actions = action_state_value_func(torch.tensor(observations, dtype=torch.float32, device=DEVICE))
-            actions = actions.argmax(1).cpu().numpy()
-        env.step_async(actions)
+    for step_idx, (observations, actions, rewards, dones) in enumerate(exp_replay):
+        observations = torch.tensor(np.moveaxis(observations, 3, 1), dtype=torch.float32, device=DEVICE)
+        actions = torch.tensor(actions.astype(np.int64), dtype=torch.int64, device=DEVICE)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=DEVICE)
+        dones = torch.tensor(dones.astype(np.float32), dtype=torch.float32, device=DEVICE)
+        with torch.no_grad():
+            next_values, _ = action_state_value_func(observations[:, 1:]).max(1)
+        values = GAMMA * (1.0 - dones) * next_values + rewards
+        optimizer.zero_grad()
+        chosen_q_values = action_state_value_func(observations[:, :-1]).gather(1, actions.unsqueeze(1))
+        loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
+        loss.backward()
+        optimizer.step()
 
-        train_step(action_state_value_func, mem, BATCH_SIZE, GAMMA, optimizer)
+        if exp_replay.exploration > MIN_EPSILON:
+            exp_replay.exploration -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
 
-        # record stats
-        current_scores += rewards
-        number_of_dones = dones.sum()
-        if number_of_dones:
-            last_scores.extend(current_scores[dones])
-            summary_writer.add_scalar('score', current_scores[dones].sum() / number_of_dones, step_idx)
-            summary_writer.add_scalar('epsilon', epsilon, step_idx)
-            if len(last_scores) > 100:
-                summary_writer.add_scalar('mean score', np.mean(last_scores), step_idx)
-                summary_writer.add_scalar('std score', np.std(last_scores), step_idx)
-                last_scores = []
-            current_scores[dones] = 0.0
-
-        if epsilon > MIN_EPSILON:
-            epsilon -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
-
-        next_observations, rewards, dones, diagnostic_infos = env.step_wait()
-        mem.add(observations, actions, rewards, next_observations, dones)
-        observations = next_observations
+        if step_idx % 1000 == 0:
+            mean, max = exp_replay.runner.reset_stats()
+            summary_writer.add_scalar('mean score', mean, step_idx)
+            summary_writer.add_scalar('max score', max, step_idx)
+            summary_writer.add_scalar('epsilon', exp_replay.exploration, step_idx)
 
 
 if __name__ == '__main__':

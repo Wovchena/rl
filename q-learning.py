@@ -57,7 +57,7 @@ class Swish(torch.nn.Module):
 class PReLU(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.alpha = torch.tensor(0.001, dtype=torch.float32, device='cuda', requires_grad=True)
+        self.alpha = torch.nn.Parameter(torch.FloatTensor((0.001,)), requires_grad=True)
 
     def forward(self, input):
         return 0.5*((1.0 + self.alpha) * input + (1.0 - self.alpha) * input.abs())
@@ -176,7 +176,8 @@ def main():
                                      state_dtype='uint8')
     exp_replay._before_train()
     exp_replay._init_memory()
-    optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
+    # optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.RMSprop(action_state_value_func.parameters(), lr=LEARNING_RATE, alpha=0.99, eps=1e-02, weight_decay=0.95, momentum=0.95, centered=False)
     exp_replay.exploration = START_EPSILON
     experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
     summary_writer = tensorboardX.SummaryWriter(experiment_name)
@@ -193,7 +194,7 @@ def main():
         values = GAMMA * (1.0 - dones) * next_values + rewards
         optimizer.zero_grad()
         chosen_q_values = action_state_value_func(observations[:, :-1]).gather(1, actions.unsqueeze(1))
-        loss = torch.nn.functional.mse_loss(chosen_q_values.squeeze(), values)
+        loss = torch.nn.functional.smooth_l1_loss(chosen_q_values.squeeze(), values)
         loss.backward()
         optimizer.step()
 

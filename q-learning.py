@@ -54,6 +54,15 @@ class Swish(torch.nn.Module):
         return input_tensor * torch.sigmoid(input_tensor)
 
 
+class PReLU(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.alpha = torch.tensor(0.001, dtype=torch.float32, device='cuda', requires_grad=True)
+
+    def forward(self, input):
+        return 0.5*((1.0 + self.alpha) * input + (1.0 - self.alpha) * input.abs())
+
+
 def define_network(state_dim, n_actions):
     return nn.Sequential(
         nn.Linear(state_dim, 80),
@@ -72,16 +81,15 @@ def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
 class DQN(torch.nn.Module):
     def __init__(self, state_dim, n_actions):
         super().__init__()
-        # like https://storage.googleapis.com/deepmind-media/dqn/DQNNaturePaper.pdf but Swish, resize not to square
-        self.conv1 = conv(state_dim, 32, kernel_size=8, stride=4, padding=4)
-        self.conv2 = conv(32, 64, kernel_size=4, stride=2, padding=2)
-        self.conv3 = conv(64, 64)  # TODO: trainable leaky RelU, no batchNorm
+        self.conv1 = torch.nn.Sequential(torch.nn.Conv2d(state_dim, 32, kernel_size=8, stride=4, padding=4), PReLU())
+        self.conv2 = torch.nn.Sequential(torch.nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=2), PReLU())
+        self.conv3 = torch.nn.Sequential(torch.nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1), PReLU())
         self.linear1 = torch.nn.Linear(7680, 512)
         self.linear2 = torch.nn.Linear(512, n_actions)
 
     def forward(self, state):
         c1 = self.conv3(self.conv2(self.conv1(state)))
-        fc1 = F.relu(self.linear1(c1.view(c1.shape[0], -1)))
+        fc1 = F.leaky_relu(self.linear1(c1.view(c1.shape[0], -1)))
         return self.linear2(fc1)
 
 

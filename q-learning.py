@@ -160,6 +160,9 @@ def main():
     REPLAY_MEMORY_SIZE = 10**6
     # action_state_value_func = define_network(env.observation_space.shape[1], env.action_space[0].n).to(DEVICE)
     action_state_value_func = DQN(4, 4).to(DEVICE)
+    target_func = DQN(4, 4).to(DEVICE)  # copy.deepcopy(action_state_value_func)
+    target_func.load_state_dict(action_state_value_func.state_dict())
+    target_func.eval()
     def predictor(history):
         with torch.no_grad():
             return action_state_value_func(
@@ -190,7 +193,7 @@ def main():
         rewards = torch.tensor(rewards, dtype=torch.float32, device=DEVICE)
         dones = torch.tensor(dones.astype(np.float32), dtype=torch.float32, device=DEVICE)
         with torch.no_grad():
-            next_values, _ = action_state_value_func(observations[:, 1:]).max(1)
+            next_values, _ = target_func(observations[:, 1:]).max(1)
         values = GAMMA * (1.0 - dones) * next_values + rewards
         optimizer.zero_grad()
         chosen_q_values = action_state_value_func(observations[:, :-1]).gather(1, actions.unsqueeze(1))
@@ -201,11 +204,13 @@ def main():
         if exp_replay.exploration > MIN_EPSILON:
             exp_replay.exploration -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
 
-        if step_idx % 1000 == 0:
+        if step_idx > 0 and step_idx % 1000 == 0:
             mean, max = exp_replay.runner.reset_stats()
             summary_writer.add_scalar('mean score', mean, step_idx)
             summary_writer.add_scalar('max score', max, step_idx)
             summary_writer.add_scalar('epsilon', exp_replay.exploration, step_idx)
+        if step_idx > 0 and step_idx % 5000 == 0:
+            target_func.load_state_dict(action_state_value_func.state_dict())  # copy.deepcopy(action_state_value_func)
 
 
 if __name__ == '__main__':

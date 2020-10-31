@@ -1,4 +1,3 @@
-import collections
 import datetime
 import itertools
 import time
@@ -26,7 +25,7 @@ class ImshowWrapper(gym.ObservationWrapper):
         return observation
 
 
-class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
+class CropResizeGrayScaleWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.shape = (94, 74)
@@ -34,16 +33,35 @@ class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
 
     def observation(self, observation):
         # observation.shape is (210, 160, 3)
-        return observation[5:-17:2, 7:-6:2, :].mean(2, dtype=np.float32) / 255
+        return observation[5:-17:2, 7:-6:2, :].mean(2, dtype=np.float32) / 255.0
+
+
+class StopScoreOnLifeLossWrapepr(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.prev_lives = 5
+
+    def step(self, action):
+        observation, reward, done, diagnostic_info = super().step(action)
+        if done:
+            self.prev_lives = 5
+            return observation, reward, True, False
+        else:
+            lives = diagnostic_info['ale.lives']
+            if lives < self.prev_lives:
+                self.prev_lives = lives
+                return observation, reward, False, False
+            else:
+                return observation, reward, False, True
 
 
 def create_env(show=False):
-    name = 'breakout'
+    name = 'space_invaders'
     if show:
-        return gym.wrappers.FrameStack(gym.wrappers.AtariPreprocessing(ImshowWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-            name, obs_type='image', frameskip=4), max_episode_steps=2_000)), frame_skip=1, terminal_on_life_loss=True, scale_obs=True), 3)
-    return gym.wrappers.FrameStack(gym.wrappers.AtariPreprocessing(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-        name, obs_type='image', frameskip=4), max_episode_steps=2_000), frame_skip=1, terminal_on_life_loss=True, scale_obs=True), 3)
+        return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(ImshowWrapper(gym.envs.atari.AtariEnv(
+            name, obs_type='image', frameskip=4)), max_episode_steps=5_000))), 3)
+    return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
+        name, obs_type='image', frameskip=4), max_episode_steps=5_000))), 3)
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
@@ -62,7 +80,7 @@ class ActorCritic(torch.nn.Module):
             conv(32, 64, kernel_size=4, stride=2, padding=2),
             conv(64, 64),
             torch.nn.Flatten(),
-            torch.nn.Linear(9216, 512),
+            torch.nn.Linear(8320, 512),
             torch.nn.ReLU())
         self.n_alternatives = n_alternatives
         if self.n_alternatives == 1:
@@ -110,58 +128,57 @@ def train_step(mem, detached_next_values, actor_critic):
 
 def main():
     # TODO random search that cuts bad params in the beginning
-    Entry = collections.namedtuple('Entry', ('distrs', 'values', 'actions', 'rewards', 'inverted_dones'))
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
-    envs = gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 38)
-    try:
-        n_actions = envs.action_space[0].n
-    except AttributeError:
-        n_actions = 1
-    actor_critic = ActorCritic(envs.observation_space.shape[1], n_actions)
+    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 39) as envs:
+        try:
+            n_actions = envs.action_space[0].n
+        except AttributeError:
+            n_actions = 1
+        actor_critic = ActorCritic(envs.observation_space.shape[1], n_actions)
 
-    current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
-    last_scores = []
-    max_mean_score = float('-inf')
-    critic_losses = []
-    mem = []
-    states = torch.as_tensor(envs.reset())
-    summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
-    t0 = time.perf_counter()
-    for step_id in itertools.count():
-        for _ in range(5):
-            distrs, values = actor_critic(states)
-            actions = distrs.sample()
-            if n_actions == 1:
-                # env needs an extra dim
-                next_observations, rewards, dones, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
-            else:
-                next_observations, rewards, dones, diagnostic_infos = envs.step(actions.cpu().numpy())
-            rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
-            mem.append(Entry(distrs, values, actions, torch.as_tensor(rewards), torch.as_tensor(~dones)))
-            next_states = torch.as_tensor(next_observations)
-            states = next_states
+        current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
+        last_scores = []
+        max_mean_score = float('-inf')
+        critic_losses = []
+        mem = []
+        states = torch.as_tensor(envs.reset())
+        summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
+        t0 = time.perf_counter()
+        for step_id in itertools.count():
+            for _ in range(5):
+                distrs, values = actor_critic(states)
+                actions = distrs.sample()
+                if n_actions == 1:
+                    # env needs an extra dim
+                    next_observations, rewards, dones, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
+                else:
+                    next_observations, rewards, dones, diagnostic_infos = envs.step(actions.cpu().numpy())
+                rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
+                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(diagnostic_infos)))
+                next_states = torch.as_tensor(next_observations)
+                states = next_states
 
-            current_scores += rewards
-            if dones.any():
-                last_scores.extend(current_scores[dones])
-                current_scores[dones] = 0.0
-                if len(last_scores) > 249:
-                    scores = np.mean(last_scores)
-                    val_loss = np.mean(critic_losses)
-                    summary_writer.add_scalar('Scalars/Score', scores, step_id)
-                    summary_writer.add_scalar('Scalars/Value loss', val_loss, step_id)
-                    dur = (time.perf_counter() - t0) / 60.0
-                    if max_mean_score < scores:
-                        max_mean_score = scores
-                    print(step_id, scores, val_loss, dur, dur / 60.0, max_mean_score)
-                    last_scores *= 0
-                    critic_losses *= 0
+                current_scores += rewards
+                if dones.any():
+                    last_scores.extend(current_scores[dones])
+                    current_scores[dones] = 0.0
+                    if len(last_scores) > 249:
+                        scores = np.mean(last_scores)
+                        val_loss = np.mean(critic_losses)
+                        summary_writer.add_scalar('Scalars/Score', scores, step_id)
+                        summary_writer.add_scalar('Scalars/Value loss', val_loss, step_id)
+                        dur = (time.perf_counter() - t0) / 60.0
+                        if max_mean_score < scores:
+                            max_mean_score = scores
+                        print(step_id, scores, val_loss, dur, dur / 60.0, max_mean_score)
+                        last_scores *= 0
+                        critic_losses *= 0
 
-        with torch.no_grad():
-            detached_next_values = actor_critic(next_states, False)
-        critic_loss = train_step(mem, detached_next_values, actor_critic)
-        critic_losses.append(critic_loss)
-        mem *= 0
+            with torch.no_grad():
+                detached_next_values = actor_critic(next_states, False)
+            critic_loss = train_step(mem, detached_next_values, actor_critic)
+            critic_losses.append(critic_loss)
+            mem *= 0
 
 
 if __name__ == '__main__':

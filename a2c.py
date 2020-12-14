@@ -113,7 +113,7 @@ def train_step(mem, detached_next_values, actor_critic):
         detached_values = mem_values.detach()
         delta = rewards + gamma * inverted_dones * detached_next_values - detached_values
         gae = delta + gamma_lambda * inverted_dones * gae
-        actor_losses.append(-1e-2 * distrs.entropy().mean() - (distrs.log_prob(actions) * gae).mean())
+        actor_losses.append(-5e-2 * distrs.entropy().mean() - (distrs.log_prob(actions) * gae).mean())
         critic_losses.append(torch.nn.functional.mse_loss(mem_values, gae + detached_values))
         detached_next_values = detached_values
 

@@ -14,26 +14,32 @@ from torch.utils import tensorboard
 class ImshowWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.time_point = float('-inf')
+        self.count = 0
+        self.limit = 5 * 100
 
     def observation(self, observation):
-        now = time.perf_counter()
-        if now - self.time_point >= 0.5:
-            cv2.imshow('', observation[:, :, ::-1])
-            cv2.waitKey(1)
-            self.time_point = now
+        if self.count >= self.limit:
+            self.count = 0
+            cv2.imshow('', observation)  # TODO show it while the net is trained. This will also allow to show multiple observations at a time
+            key = cv2.waitKey(1)
+            if key != -1:
+                key = chr(key)
+                if '0' <= key <= '9':
+                    self.limit = int(key) * 100
+        else:
+            self.count += 1
         return observation
 
 
 class CropResizeGrayScaleWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.shape = (94, 74)
+        self.shape = (94, 147)
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=self.shape, dtype=np.float32)
 
     def observation(self, observation):
         # observation.shape is (210, 160, 3)
-        return observation[5:-17:2, 7:-6:2, :].mean(2, dtype=np.float32) / 255.0
+        return observation[5:-17:2, 7:-6, :].mean(2, dtype=np.float32) / 255.0
 
 
 class StopScoreOnLifeLossWrapepr(gym.Wrapper):
@@ -58,10 +64,10 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
 def create_env(show=False):
     name = 'space_invaders'
     if show:
-        return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(ImshowWrapper(gym.envs.atari.AtariEnv(
-            name, obs_type='image', frameskip=4)), max_episode_steps=5_000))), 3)
+        return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
+            name, obs_type='image', frameskip=3), max_episode_steps=50_000)))), 3)
     return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-        name, obs_type='image', frameskip=4), max_episode_steps=5_000))), 3)
+        name, obs_type='image', frameskip=3), max_episode_steps=50_000))), 3)
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
@@ -80,7 +86,7 @@ class ActorCritic(torch.nn.Module):
             conv(32, 64, kernel_size=4, stride=2, padding=2),
             conv(64, 64),
             torch.nn.Flatten(),
-            torch.nn.Linear(8320, 512),
+            torch.nn.Linear(15808, 512),
             torch.nn.ReLU())
         self.n_alternatives = n_alternatives
         if self.n_alternatives == 1:
@@ -89,7 +95,7 @@ class ActorCritic(torch.nn.Module):
         self.actor = torch.nn.Linear(512, self.n_alternatives)
         self.critic = torch.nn.Linear(512, 1)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), 7e-4)  # TODO weight_decay and then mish
+        self.optimizer = torch.optim.Adam(self.parameters(), 3.5e-5)  # TODO weight_decay and then mish
 
     def forward(self, state, predict_distr=True):
         features = self.extractor(state)
@@ -107,27 +113,32 @@ def train_step(mem, detached_next_values, actor_critic):
     gamma = 0.99
     gamma_lambda = gamma * 0.95
     actor_losses = []
+    entropy_losses = []
     critic_losses = []
     gae = 0.0
     for distrs, mem_values, actions, rewards, inverted_dones in reversed(mem):
         detached_values = mem_values.detach()
         delta = rewards + gamma * inverted_dones * detached_next_values - detached_values
         gae = delta + gamma_lambda * inverted_dones * gae
-        actor_losses.append(-5e-2 * distrs.entropy().mean() - (distrs.log_prob(actions) * gae).mean())
+        actor_losses.append((distrs.log_prob(actions) * gae))  # TODO mean here or only globally after this loop
+        entropy_losses.append(distrs.entropy())
         critic_losses.append(torch.nn.functional.mse_loss(mem_values, gae + detached_values))
         detached_next_values = detached_values
 
-    critic_loss = torch.stack(critic_losses).mean()
+    actor_loss = -20.0 * torch.stack(actor_losses).mean()
+    entropy_loss = -torch.stack(entropy_losses).mean()
+    critic_loss = 5.0 * torch.stack(critic_losses).mean()
 
     actor_critic.optimizer.zero_grad()
-    (torch.stack(actor_losses).mean() + 0.25 * critic_loss).backward()
+    (actor_loss + entropy_loss + critic_loss).backward()
     torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.4)
     actor_critic.optimizer.step()
-    return critic_loss.item()
+    return actor_loss.detach().cpu().numpy(), entropy_loss.detach().cpu().numpy(), critic_loss.detach().cpu().numpy()  # TODO item() vs numpy()
 
 
 def main():
     # TODO random search that cuts bad params in the beginning
+    # TODO report results for random policy
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
     with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 39) as envs:
         try:
@@ -139,10 +150,10 @@ def main():
         current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
         last_scores = []
         max_mean_score = float('-inf')
-        critic_losses = []
+        weighted_losses = []
         mem = []
         states = torch.as_tensor(envs.reset())
-        summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
+        summary_writer = None
         t0 = time.perf_counter()
         for step_id in itertools.count():
             for _ in range(5):
@@ -164,20 +175,24 @@ def main():
                     current_scores[dones] = 0.0
                     if len(last_scores) > 249:
                         scores = np.mean(last_scores)
-                        val_loss = np.mean(critic_losses)
-                        summary_writer.add_scalar('Scalars/Score', scores, step_id)
-                        summary_writer.add_scalar('Scalars/Value loss', val_loss, step_id)
+                        mean_losses = np.mean(weighted_losses, axis=0)
                         dur = (time.perf_counter() - t0) / 60.0
                         if max_mean_score < scores:
                             max_mean_score = scores
-                        print(step_id, scores, val_loss, dur, dur / 60.0, max_mean_score)
                         last_scores *= 0
-                        critic_losses *= 0
+                        weighted_losses *= 0
+                        if summary_writer is None:
+                            summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
+                        summary_writer.add_scalar('Score', scores, step_id)
+                        summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_id)
+                        summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_id)
+                        summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_id)  # TODO report distribution over actions
+                        print(step_id, scores, mean_losses, dur, dur / 60.0, max_mean_score)
 
             with torch.no_grad():
                 detached_next_values = actor_critic(next_states, False)
-            critic_loss = train_step(mem, detached_next_values, actor_critic)
-            critic_losses.append(critic_loss)
+            weighted_loss = train_step(mem, detached_next_values, actor_critic)
+            weighted_losses.append(weighted_loss)
             mem *= 0
 
 

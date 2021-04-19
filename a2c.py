@@ -62,7 +62,7 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
 
 
 def create_env(show=False):
-    name = 'pong'
+    name = 'space_invaders'
     if show:
         return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
             name, obs_type='image', frameskip=3), max_episode_steps=50_000)))), 3)
@@ -90,6 +90,7 @@ class ActorCritic(torch.nn.Module):
             torch.nn.LeakyReLU(),
             torch.nn.Linear(512, 512),
             torch.nn.LeakyReLU())
+        self.lstm = torch.nn.LSTMCell(513, 512)
         self.n_alternatives = n_alternatives
         if self.n_alternatives == 1:
             self.sigma = torch.nn.Parameter(torch.tensor(1.0))
@@ -99,16 +100,18 @@ class ActorCritic(torch.nn.Module):
 
         self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish
 
-    def forward(self, state, predict_distr=True):
-        features = self.extractor(state)
-        if predict_distr:
+    def forward(self, state, ax, hx, value_only=False):  # ax[B, 1]
+        features = torch.cat([self.extractor(state), ax], dim=1)
+        hn = self.lstm(features, hx)
+        features = hn[0]
+        if value_only:
+            return self.critic(features).squeeze()
+        else:
             distr_params = self.actor(features)
             if self.n_alternatives == 1:
-                return torch.distributions.Normal(distr_params.squeeze(), self.sigma), self.critic(features).squeeze()
+                return torch.distributions.Normal(distr_params.squeeze(), self.sigma), self.critic(features).squeeze(), hn
             else:
-                return torch.distributions.Categorical(logits=distr_params), self.critic(features).squeeze()
-        else:
-            return self.critic(features).squeeze()
+                return torch.distributions.Categorical(logits=distr_params), self.critic(features).squeeze(), hn
 
 
 def train_step(mem, detached_next_values, actor_critic):
@@ -165,6 +168,8 @@ def main():
         except AttributeError:
             n_actions = 1
         actor_critic = ActorCritic(envs.observation_space.shape[1], n_actions)
+        prev_a = -torch.ones([envs.num_envs, 1])
+        prev_h = (torch.zeros([envs.num_envs, 512]), torch.zeros([envs.num_envs, 512]))
 
         current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
         last_scores = []
@@ -175,8 +180,9 @@ def main():
         t0 = time.perf_counter()
         for step_id in itertools.count():
             for _ in range(5):
-                distrs, values = actor_critic(states)
+                distrs, values, prev_h = actor_critic(states, prev_a, prev_h)
                 actions = distrs.sample()
+                prev_a = actions.detach()[:, None]  # extra dim to cat it with state
                 if n_actions == 1:
                     # env needs an extra dim
                     next_observations, rewards, dones, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
@@ -189,6 +195,10 @@ def main():
 
                 current_scores += rewards
                 if dones.any():
+                    prev_a = prev_a.clone()
+                    prev_a[dones] = -1.0
+                    inverted_dones = (~dones)[:, None]
+                    prev_h = prev_h[0] * torch.as_tensor(inverted_dones), prev_h[1] * torch.as_tensor(inverted_dones)
                     last_scores.extend(current_scores[dones])
                     current_scores[dones] = 0.0
                     if len(last_scores) > 249:
@@ -208,8 +218,9 @@ def main():
                         print(step_id, scores, mean_losses, dur, dur / 60.0, max_mean_score)
 
             with torch.no_grad():
-                detached_next_values = actor_critic(next_states, False)
+                detached_next_values = actor_critic(next_states, prev_a, prev_h, value_only=True)
             weighted_loss = train_step(mem, detached_next_values, actor_critic)
+            prev_h = prev_h[0].detach(), prev_h[1].detach()
             weighted_losses.append(weighted_loss)
             mem *= 0
 

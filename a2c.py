@@ -15,12 +15,12 @@ class ImshowWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.count = 0
-        self.limit = 5 * 100
+        self.limit = 9 * 100
 
     def observation(self, observation):
         if self.count >= self.limit:
             self.count = 0
-            cv2.imshow('', observation)  # TODO show it while the net is trained. This will also allow to show multiple observations at a time
+            cv2.imshow('', observation)  # TODO show it while the net is trained. This will also allow to show multiple observations at a time and draw graphs of and critic loss, actions distribution on an image and state embedding
             key = cv2.waitKey(1)
             if key != -1:
                 key = chr(key)
@@ -62,7 +62,7 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
 
 
 def create_env(show=False):
-    name = 'space_invaders'
+    name = 'pong'
     if show:
         return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
             name, obs_type='image', frameskip=3), max_episode_steps=50_000)))), 3)
@@ -74,7 +74,7 @@ def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
     return torch.nn.Sequential(
         torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size, stride=stride, padding=padding),
         # torch.nn.BatchNorm2d(out_features),  # TODO try it
-        torch.nn.ReLU())  # TODO leaky relu
+        torch.nn.LeakyReLU())
 
 
 class ActorCritic(torch.nn.Module):
@@ -87,7 +87,9 @@ class ActorCritic(torch.nn.Module):
             conv(64, 64),
             torch.nn.Flatten(),
             torch.nn.Linear(15808, 512),
-            torch.nn.ReLU())
+            torch.nn.LeakyReLU(),
+            torch.nn.Linear(512, 512),
+            torch.nn.LeakyReLU())
         self.n_alternatives = n_alternatives
         if self.n_alternatives == 1:
             self.sigma = torch.nn.Parameter(torch.tensor(1.0))
@@ -95,7 +97,7 @@ class ActorCritic(torch.nn.Module):
         self.actor = torch.nn.Linear(512, self.n_alternatives)
         self.critic = torch.nn.Linear(512, 1)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), 3.5e-5)  # TODO weight_decay and then mish
+        self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish
 
     def forward(self, state, predict_distr=True):
         features = self.extractor(state)
@@ -122,25 +124,42 @@ def train_step(mem, detached_next_values, actor_critic):
         gae = delta + gamma_lambda * inverted_dones * gae
         actor_losses.append((distrs.log_prob(actions) * gae))  # TODO mean here or only globally after this loop
         entropy_losses.append(distrs.entropy())
-        critic_losses.append(torch.nn.functional.mse_loss(mem_values, gae + detached_values))
+        critic_losses.append(torch.nn.functional.mse_loss(mem_values, gae + detached_values, reduction='none'))
         detached_next_values = detached_values
 
     actor_loss = -20.0 * torch.stack(actor_losses).mean()
-    entropy_loss = -torch.stack(entropy_losses).mean()
-    critic_loss = 5.0 * torch.stack(critic_losses).mean()
+    entropy_loss = torch.stack(entropy_losses).mean()
+    critic_loss = torch.stack(critic_losses).mean()
 
     actor_critic.optimizer.zero_grad()
-    (actor_loss + entropy_loss + critic_loss).backward()
+    (actor_loss - entropy_loss + critic_loss).backward()
     torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.4)
     actor_critic.optimizer.step()
     return actor_loss.detach().cpu().numpy(), entropy_loss.detach().cpu().numpy(), critic_loss.detach().cpu().numpy()  # TODO item() vs numpy()
 
 
+def randplay(envs):
+    current_scores = np.zeros((envs.num_envs,), dtype=np.float64)  # VectorEnv returns with default dtype which is np.float64
+    last_scores = []
+    envs.reset()
+    for step_id in itertools.count():
+        next_observations, rewards, dones, diagnostic_infos = envs.step(envs.action_space.sample())
+
+        current_scores += rewards
+        if dones.any():
+            last_scores.extend(current_scores[dones])
+            current_scores[dones] = 0.0
+            if len(last_scores) > 249:
+                print(np.mean(last_scores))
+                return next_observations
+
 def main():
     # TODO random search that cuts bad params in the beginning
-    # TODO report results for random policy
+    # TODO report longest game to set more accurate max_episode_steps
+    # TODO assume game continues when max_episode_steps is hit
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
     with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 39) as envs:
+        states = torch.as_tensor(randplay(envs))
         try:
             n_actions = envs.action_space[0].n
         except AttributeError:
@@ -152,7 +171,6 @@ def main():
         max_mean_score = float('-inf')
         weighted_losses = []
         mem = []
-        states = torch.as_tensor(envs.reset())
         summary_writer = None
         t0 = time.perf_counter()
         for step_id in itertools.count():

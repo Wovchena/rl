@@ -81,6 +81,7 @@ class ActorCritic(torch.nn.Module):
     def __init__(self, state_dim, n_alternatives):
         """n_alternatives == 1 -> Normal"""
         super().__init__()  # TODO MLP backbone
+        # TODO different init weights
         self.extractor = torch.nn.Sequential(
             conv(state_dim, 32, kernel_size=8, stride=4, padding=4),
             conv(32, 64, kernel_size=4, stride=2, padding=2),
@@ -95,15 +96,18 @@ class ActorCritic(torch.nn.Module):
         if self.n_alternatives == 1:
             self.sigma = torch.nn.Parameter(torch.tensor(1.0))
 
-        self.actor = torch.nn.Linear(512, self.n_alternatives)
-        self.critic = torch.nn.Linear(512, 1)
+        self.actor = torch.nn.Linear(513, self.n_alternatives)
+        self.critic = torch.nn.Linear(513, 1)
 
         self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish
 
     def forward(self, state, ax, hx, value_only=False):  # ax[B, 1]
+        ax = torch.zeros_like(ax)
+        hx = torch.zeros_like(hx[0]), torch.zeros_like(hx[1])
         features = torch.cat([self.extractor(state), ax], dim=1)
-        hn = self.lstm(features, hx)
-        features = hn[0]
+        #hn = self.lstm(features, hx)
+        hn = hx
+        #features = hn[0]
         if value_only:
             return self.critic(features).squeeze()
         else:

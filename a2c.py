@@ -38,8 +38,8 @@ class CropResizeGrayScaleWrapper(gym.ObservationWrapper):
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=self.shape, dtype=np.float32)
 
     def observation(self, observation):
-        # observation.shape is (210, 160, 3)
-        return observation[5:-17:2, 7:-6, :].mean(2, dtype=np.float32) / 255.0
+        # observation.shape is (210, 160)
+        return observation[5:-17:2, 7:-6].astype(np.float32) / 255.0
 
 
 class StopScoreOnLifeLossWrapepr(gym.Wrapper):
@@ -51,23 +51,23 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
         observation, reward, done, diagnostic_info = super().step(action)
         if done:
             self.prev_lives = 5
-            return observation, reward, True, False
+            return observation, reward, True, {None: False}
         else:
-            lives = diagnostic_info['ale.lives']
+            lives = diagnostic_info['lives']
             if lives < self.prev_lives:
                 self.prev_lives = lives
-                return observation, reward, False, False
+                return observation, reward, False, {None: False}
             else:
-                return observation, reward, False, True
+                return observation, reward, False, {None: True}
 
 
 def create_env(show=False):
-    name = 'pong'
+    name = 'space_invaders'
     if show:
         return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-            name, obs_type='image', frameskip=3), max_episode_steps=50_000)))), 3)
+            name, obs_type='grayscale', frameskip=3, repeat_action_probability=0.0, full_action_space=False), max_episode_steps=50_000)))), 3)
     return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-        name, obs_type='image', frameskip=3), max_episode_steps=50_000))), 3)
+        name, obs_type='grayscale', frameskip=3, repeat_action_probability=0.0, full_action_space=False), max_episode_steps=50_000))), 3)
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
@@ -150,16 +150,17 @@ def randplay(envs):
             last_scores.extend(current_scores[dones])
             current_scores[dones] = 0.0
             if len(last_scores) > 249:
-                print(np.mean(last_scores))
-                return next_observations
+                baseline = np.mean(last_scores)
+                print(f'{baseline = }')
+                return torch.as_tensor(next_observations), baseline
 
 def main():
     # TODO random search that cuts bad params in the beginning
     # TODO report longest game to set more accurate max_episode_steps
     # TODO assume game continues when max_episode_steps is hit
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
-    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 39) as envs:
-        states = torch.as_tensor(randplay(envs))
+    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=False),) + (create_env,) * 39) as envs:
+        states, max_mean_score = randplay(envs)
         try:
             n_actions = envs.action_space[0].n
         except AttributeError:
@@ -168,7 +169,6 @@ def main():
 
         current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
         last_scores = []
-        max_mean_score = float('-inf')
         weighted_losses = []
         mem = []
         summary_writer = None
@@ -183,7 +183,7 @@ def main():
                 else:
                     next_observations, rewards, dones, diagnostic_infos = envs.step(actions.cpu().numpy())
                 rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
-                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(diagnostic_infos)))
+                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(tuple(alive[None] for alive in diagnostic_infos))))
                 next_states = torch.as_tensor(next_observations)
                 states = next_states
 
@@ -194,18 +194,23 @@ def main():
                     if len(last_scores) > 249:
                         scores = np.mean(last_scores)
                         mean_losses = np.mean(weighted_losses, axis=0)
-                        dur = (time.perf_counter() - t0) / 60.0
+                        mins = round((time.perf_counter() - t0) / 60.0)
+                        hours, mins = divmod(mins, 60)
                         if max_mean_score < scores:
                             max_mean_score = scores
+                            color = '\33[36m'
+                        else:
+                            color = '\33[m'
                         last_scores *= 0
                         weighted_losses *= 0
                         if summary_writer is None:
                             summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
-                        summary_writer.add_scalar('Score', scores, step_id)
-                        summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_id)
-                        summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_id)
-                        summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_id)  # TODO report distribution over actions
-                        print(step_id, scores, mean_losses, dur, dur / 60.0, max_mean_score)
+                        step_idk = step_id * 0.001
+                        summary_writer.add_scalar('Score', scores, step_idk)
+                        summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_idk)
+                        summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_idk)
+                        summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_idk)  # TODO report distribution over actions
+                        print(f'{color}{step_idk:5,.0f}k {hours:2}:{mins:2} {scores:7,.1f} {mean_losses}')
 
             with torch.no_grad():
                 detached_next_values = actor_critic(next_states, False)

@@ -1,5 +1,6 @@
 import datetime
 import itertools
+import os
 import time
 
 import cv2
@@ -62,18 +63,18 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
 
 
 def create_env(show=False):
-    name = 'space_invaders'
+    envargs = {'game': 'pong', 'mode': None, 'difficulty': None, 'obs_type': 'grayscale', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True, 'render_mode': None}
     if show:
         return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-            name, obs_type='grayscale', frameskip=3, repeat_action_probability=0.0, full_action_space=False), max_episode_steps=50_000)))), 3)
+            **envargs), max_episode_steps=50_000)))), 3)
     return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-        name, obs_type='grayscale', frameskip=3, repeat_action_probability=0.0, full_action_space=False), max_episode_steps=50_000))), 3)
+        **envargs), max_episode_steps=50_000))), 3)
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
     return torch.nn.Sequential(
         torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size, stride=stride, padding=padding),
-        # torch.nn.BatchNorm2d(out_features),  # TODO try it
+        # torch.nn.BatchNorm2d(out_features),  # TODO try it, but better pick good weght init: https://arxiv.org/abs/1901.09321
         torch.nn.LeakyReLU())
 
 
@@ -97,7 +98,16 @@ class ActorCritic(torch.nn.Module):
         self.actor = torch.nn.Linear(512, self.n_alternatives)
         self.critic = torch.nn.Linear(512, 1)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish
+        # From https://github.com/DLR-RM/stable-baselines3/blob/201fbffa8c40a628ecb2b30fd0973f3b171e6c4c/stable_baselines3/common/policies.py#L565
+        for module in self.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))  # TODO try kaiming_normal_: https://adityassrana.github.io/blog/theory/2020/08/26/Weight-Init.html
+                if module.bias is not None:
+                    module.bias.data.fill_(0.0)
+        torch.nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        torch.nn.init.orthogonal_(self.critic.weight, gain=1.0)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish  # TODO AdamW
 
     def forward(self, state, predict_distr=True):
         features = self.extractor(state)
@@ -159,7 +169,7 @@ def main():
     # TODO report longest game to set more accurate max_episode_steps
     # TODO assume game continues when max_episode_steps is hit
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
-    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=False),) + (create_env,) * 39) as envs:
+    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 39) as envs:
         states, max_mean_score = randplay(envs)
         try:
             n_actions = envs.action_space[0].n
@@ -183,7 +193,7 @@ def main():
                 else:
                     next_observations, rewards, dones, diagnostic_infos = envs.step(actions.cpu().numpy())
                 rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
-                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(tuple(alive[None] for alive in diagnostic_infos))))
+                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor([alive[None] for alive in diagnostic_infos])))
                 next_states = torch.as_tensor(next_observations)
                 states = next_states
 
@@ -204,13 +214,13 @@ def main():
                         last_scores *= 0
                         weighted_losses *= 0
                         if summary_writer is None:
-                            summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
-                        step_idk = step_id * 0.001
+                            summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime(f'{os.path.dirname(os.path.abspath(__file__))}/logs/%d-%m-%Y %H-%M'))
+                        step_idk = round(step_id * 0.001)
                         summary_writer.add_scalar('Score', scores, step_idk)
                         summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_idk)
                         summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_idk)
                         summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_idk)  # TODO report distribution over actions
-                        print(f'{color}{step_idk:5,.0f}k {hours:2}:{mins:2} {scores:7,.1f} {mean_losses}')
+                        print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:7,.1f} {mean_losses}')
 
             with torch.no_grad():
                 detached_next_values = actor_critic(next_states, False)

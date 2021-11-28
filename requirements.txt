@@ -1,3 +1,3 @@
-ale-py
-tensorboard
-torch
+ale-py >= 0.7.3
+tensorboard >= 2.7.0
+torch >= 1.10.0+cu113

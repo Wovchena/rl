@@ -62,16 +62,17 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
                 return observation, reward, False, {None: True}
 
 
-def create_env(show=False):
+def imgenv(show=False):
     envargs = {'game': 'space_invaders', 'mode': None, 'difficulty': None, 'obs_type': 'grayscale', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True, 'render_mode': None}
     if show:
         return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-            **envargs), max_episode_steps=50_000)))), 3)
+            **envargs), max_episode_steps=50_000)))), 1)
     return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropResizeGrayScaleWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv(
-        **envargs), max_episode_steps=50_000))), 3)
+        **envargs), max_episode_steps=50_000))), 1)
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
+    # TODO kaiming_uniform_, kaiming_norm_
     return torch.nn.Sequential(
         torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size, stride=stride, padding=padding),
         # torch.nn.BatchNorm2d(out_features),  # TODO try it, but better pick good weght init: https://arxiv.org/abs/1901.09321
@@ -82,50 +83,46 @@ class ActorCritic(torch.nn.Module):
     def __init__(self, state_dim, n_alternatives):
         """n_alternatives == 1 -> Normal"""
         super().__init__()  # TODO MLP backbone
-        # TODO different init weights
         self.extractor = torch.nn.Sequential(
             conv(state_dim, 32, kernel_size=8, stride=4, padding=4),
             conv(32, 64, kernel_size=4, stride=2, padding=2),
             conv(64, 64),
             torch.nn.Flatten(),
             torch.nn.Linear(15808, 512),
-            torch.nn.LeakyReLU(),
-            torch.nn.Linear(512, 512),
             torch.nn.LeakyReLU())
-        self.lstm = torch.nn.LSTMCell(513, 512)
+        self.lstm = torch.nn.LSTMCell(512+n_alternatives, 513)  # TODO GRU
+        self.actor = torch.nn.Linear(513, n_alternatives)
+        self.critic = torch.nn.Linear(513, 1)
         self.n_alternatives = n_alternatives
         if self.n_alternatives == 1:
             self.sigma = torch.nn.Parameter(torch.tensor(1.0))
 
-        self.actor = torch.nn.Linear(513, self.n_alternatives)
-        self.critic = torch.nn.Linear(513, 1)
-
         # From https://github.com/DLR-RM/stable-baselines3/blob/201fbffa8c40a628ecb2b30fd0973f3b171e6c4c/stable_baselines3/common/policies.py#L565
         for module in self.modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))  # TODO try kaiming_normal_: https://adityassrana.github.io/blog/theory/2020/08/26/Weight-Init.html
+                torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))  # TODO try kaiming_normal_: https://adityassrana.github.io/blog/theory/2020/08/26/Weight-Init.html, xavier, visualize features with PCA
                 if module.bias is not None:
                     module.bias.data.fill_(0.0)
+        for name, param in self.lstm.named_parameters():
+            if 'weight' in name:
+                torch.nn.init.orthogonal_(param)
         torch.nn.init.orthogonal_(self.actor.weight, gain=0.01)
         torch.nn.init.orthogonal_(self.critic.weight, gain=1.0)
 
         self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish  # TODO AdamW
 
     def forward(self, state, ax, hx, value_only=False):  # ax[B, 1]
-        ax = torch.zeros_like(ax)
-        hx = torch.zeros_like(hx[0]), torch.zeros_like(hx[1])
         features = torch.cat([self.extractor(state), ax], dim=1)
-        #hn = self.lstm(features, hx)
-        hn = hx
-        #features = hn[0]
+        hn = self.lstm(features, hx)
+        temporal = hn[0]
         if value_only:
-            return self.critic(features).squeeze()
+            return self.critic(temporal).squeeze()
         else:
-            distr_params = self.actor(features)
+            distr_params = self.actor(temporal)
             if self.n_alternatives == 1:
-                return torch.distributions.Normal(distr_params.squeeze(), self.sigma), self.critic(features).squeeze(), hn
+                return torch.distributions.Normal(distr_params.squeeze(), self.sigma), self.critic(temporal).squeeze(), hn
             else:
-                return torch.distributions.Categorical(logits=distr_params), self.critic(features).squeeze(), hn
+                return torch.distributions.Categorical(logits=distr_params), self.critic(temporal).squeeze(), hn
 
 
 def train_step(mem, detached_next_values, actor_critic):
@@ -176,15 +173,16 @@ def main():
     # TODO report longest game to set more accurate max_episode_steps
     # TODO assume game continues when max_episode_steps is hit
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
-    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: create_env(show=True),) + (create_env,) * 39) as envs:
+    # TODO try wrappers from stable-baselines3
+    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: imgenv(show=True),) + (imgenv,) * 39) as envs:
         states, max_mean_score = randplay(envs)
         try:
             n_actions = envs.action_space[0].n
         except AttributeError:
             n_actions = 1
         actor_critic = ActorCritic(envs.observation_space.shape[1], n_actions)
-        prev_a = -torch.ones([envs.num_envs, 1])
-        prev_h = (torch.zeros([envs.num_envs, 512]), torch.zeros([envs.num_envs, 512]))
+        one_hot = torch.zeros([envs.num_envs, n_actions])
+        prev_h = torch.zeros([envs.num_envs, 513]), torch.zeros([envs.num_envs, 513])
 
         current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
         last_scores = []
@@ -194,9 +192,10 @@ def main():
         t0 = time.perf_counter()
         for step_id in itertools.count():
             for _ in range(5):
-                distrs, values, prev_h = actor_critic(states, prev_a, prev_h)
+                distrs, values, prev_h = actor_critic(states, one_hot, prev_h)
                 actions = distrs.sample()
-                prev_a = actions.detach()[:, None]  # extra dim to cat it with state
+                one_hot = torch.nn.functional.one_hot(actions, num_classes=n_actions)
+                # one_hot = torch.rand_like(one_hot)
                 if n_actions == 1:
                     # env needs an extra dim
                     next_observations, rewards, dones, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
@@ -209,10 +208,9 @@ def main():
 
                 current_scores += rewards
                 if dones.any():
-                    prev_a = prev_a.clone()
-                    prev_a[dones] = -1.0
-                    inverted_dones = (~dones)[:, None]
-                    prev_h = prev_h[0] * torch.as_tensor(inverted_dones), prev_h[1] * torch.as_tensor(inverted_dones)
+                    one_hot[dones] = 0
+                    inverted_dones = torch.as_tensor((~dones)[:, None])
+                    prev_h = prev_h[0] * inverted_dones, prev_h[1] * inverted_dones  # Stop grad for completed envs
                     last_scores.extend(current_scores[dones])
                     current_scores[dones] = 0.0
                     if len(last_scores) > 249:
@@ -237,9 +235,9 @@ def main():
                         print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:7,.1f} {mean_losses}')
 
             with torch.no_grad():
-                detached_next_values = actor_critic(next_states, prev_a, prev_h, value_only=True)
+                detached_next_values = actor_critic(next_states, one_hot, prev_h, value_only=True)
             weighted_loss = train_step(mem, detached_next_values, actor_critic)
-            prev_h = prev_h[0].detach(), prev_h[1].detach()
+            prev_h = prev_h[0].detach(), prev_h[1].detach()  # TODO don't stop grad
             weighted_losses.append(weighted_loss)
             mem *= 0
 

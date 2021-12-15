@@ -21,8 +21,8 @@ class ImshowWrapper(gym.ObservationWrapper):
     def observation(self, observation):
         if self.count >= self.limit:
             self.count = 0
-            cv2.imshow('', observation)  # TODO show it while the net is trained. This will also allow to show multiple observations at a time and draw graphs of and critic loss, actions distribution on an image and state embedding
-            key = cv2.pollKey()
+            cv2.imshow('', observation)  # TODO show it while the net trains. This will also allow to show multiple observations at a time and draw graphs of and critic loss, actions distribution on an image and state embedding
+            key = cv2.waitKey(1)
             if key != -1:
                 key = chr(key)
                 if '0' <= key <= '9':
@@ -43,7 +43,7 @@ class MetaRenderWrapper(gym.Wrapper):
         if self.count >= self.limit:
             self.count = 0
             cv2.imshow('', diagnostic_info['rgb'][:, :, ::-1])
-            key = cv2.pollKey()
+            key = cv2.waitKey(1)
             if key != -1:
                 key = chr(key)
                 if '0' <= key <= '9':
@@ -128,7 +128,7 @@ class InvertDonesWrapper(gym.Wrapper):
 
 
 def imenv(show=False):
-    envargs = {'game': 'breakout', 'mode': None, 'difficulty': None, 'obs_type': 'grayscale', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True, 'render_mode': None}
+    envargs = {'game': 'space_invaders', 'mode': None, 'difficulty': None, 'obs_type': 'grayscale', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True, 'render_mode': None}
     if show:
         return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(gym.envs.atari.AtariEnv(
             **envargs), max_episode_steps=50_000)))), 1)
@@ -151,32 +151,32 @@ def classicenv(show=False):
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
-    # TODO kaiming_uniform_, kaiming_norm_
     return torch.nn.Sequential(
-        torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size, stride=stride, padding=padding),
-        # torch.nn.BatchNorm2d(out_features),  # TODO try it, but better pick good weght init: https://arxiv.org/abs/1901.09321
+        torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+        torch.nn.BatchNorm2d(out_features),
+        torch.nn.LeakyReLU())  # TODO mish
+
+
+def fc(in_features, out_features):
+    return torch.nn.Sequential(
+        torch.nn.Linear(in_features, out_features, bias=False),
+        torch.nn.BatchNorm1d(out_features),
         torch.nn.LeakyReLU())
 
 
 class ActorCritic(torch.nn.Module):
     def __init__(self, state_dim, n_alternatives):
         """n_alternatives == 1 -> Normal"""
-        super().__init__()  # TODO MLP backbone
+        super().__init__()
         self.extractor = torch.nn.Sequential(
             conv(state_dim, 32, kernel_size=8, stride=4, padding=4),
             conv(32, 64, kernel_size=4, stride=2, padding=2),  # TODO 264 channles trains slower but reaches highter res
             conv(64, 64),
             torch.nn.Flatten(),
-            torch.nn.Linear(15808, 512),
-            torch.nn.LeakyReLU()) if state_dim == 1 else torch.nn.Sequential(
-                torch.nn.Linear(state_dim, 128),  # TODO 256
-                torch.nn.LeakyReLU(),
-                torch.nn.Linear(128, 128),
-                torch.nn.LeakyReLU(),
-                torch.nn.Linear(128, 128),
-                torch.nn.LeakyReLU(),
-                torch.nn.Linear(128, 512),  # TODO dropout
-                torch.nn.LeakyReLU())
+            fc(15808, 512)) if state_dim == 1 else torch.nn.Sequential(  # TODO mix perfomed action into state, not action
+                fc(state_dim, 128),
+                fc(128, 128),
+                fc(128, 512))
         self.lstm = torch.nn.LSTMCell(512+n_alternatives, 513)  # TODO GRU  # TODO 513->512
         self.actor = torch.nn.Linear(513, n_alternatives)
         self.critic = torch.nn.Linear(513, 1)
@@ -184,19 +184,24 @@ class ActorCritic(torch.nn.Module):
         if self.n_alternatives == 1:
             self.sigma = torch.nn.Parameter(torch.tensor(1.0))
 
-        # From https://github.com/DLR-RM/stable-baselines3/blob/201fbffa8c40a628ecb2b30fd0973f3b171e6c4c/stable_baselines3/common/policies.py#L565
-        for module in self.modules():
+        for module in self.extractor.modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))  # TODO try kaiming_normal_: https://adityassrana.github.io/blog/theory/2020/08/26/Weight-Init.html, xavier, visualize features with PCA
+                torch.nn.init.kaiming_normal_(module.weight, 1e-2)
                 if module.bias is not None:
-                    module.bias.data.fill_(0.0)
-        for name, param in self.lstm.named_parameters():
-            if 'weight' in name:
-                torch.nn.init.orthogonal_(param)
-        torch.nn.init.orthogonal_(self.actor.weight, gain=0.01)
-        torch.nn.init.orthogonal_(self.critic.weight, gain=1.0)
+                    torch.nn.init.zeros_(module.bias)
+        torch.nn.init.kaiming_normal_(self.actor.weight, 1e-2)
+        if self.actor.bias is not None:
+            torch.nn.init.zeros_(self.actor.bias)
+        torch.nn.init.kaiming_normal_(self.critic.weight, 1e-2)
+        if self.actor.bias is not None:
+            torch.nn.init.zeros_(self.critic.bias)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), 7e-4, weight_decay=1e-5)  # TODO mish  # TODO AdamW
+        torch.nn.init.orthogonal_(self.lstm.weight_ih)
+        torch.nn.init.zeros_(self.lstm.bias_ih)
+        torch.nn.init.orthogonal_(self.lstm.weight_hh)
+        torch.nn.init.zeros_(self.lstm.bias_hh)
+
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=7e-4, weight_decay=1e-5)
 
     def forward(self, state, ax, hx, value_only=False):  # ax[B, 1]
         features = torch.cat([self.extractor(state), ax], dim=1)
@@ -240,7 +245,7 @@ def train_step(mem, detached_next_values, actor_critic):
 
 
 def randplay(envs):
-    current_scores = np.zeros((envs.num_envs,), dtype=np.float64)  # VectorEnv returns with default dtype which is np.float64
+    current_scores = np.zeros((envs.num_envs,))  # VectorEnv returns with default dtype which is np.float64
     last_scores = []
     envs.reset()
     for step_id in itertools.count():
@@ -283,8 +288,8 @@ def main():
             for _ in range(5):
                 distrs, values, prev_h = actor_critic(states, one_hot, prev_h)
                 actions = distrs.sample()
+                # one_hot = actions[:, None]  # For Pendulum-v1 with one continuous action
                 one_hot = torch.nn.functional.one_hot(actions, num_classes=n_actions)
-                # one_hot = torch.rand_like(one_hot)
                 if n_actions == 1:
                     # env needs an extra dim
                     next_observations, rewards, dones, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
@@ -315,13 +320,13 @@ def main():
                         last_scores *= 0
                         weighted_losses *= 0
                         if summary_writer is None:
-                            summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime(f'{os.path.dirname(os.path.abspath(__file__))}/logs/%d-%m-%Y %H-%M'))
+                            summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime(f'{os.path.dirname(os.path.abspath(__file__))}/runs/%d%b%H-%M'))
                         step_idk = round(step_id * 0.001)
                         summary_writer.add_scalar('Score', scores, step_idk)
                         summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_idk)
                         summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_idk)
                         summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_idk)  # TODO report distribution over actions
-                        print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:7,.1f} {mean_losses}')  # TODO tqdm
+                        print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:8,.1f} {mean_losses}')  # TODO tqdm  # TODO customize np print
 
             with torch.no_grad():
                 detached_next_values = actor_critic(next_states, one_hot, prev_h, value_only=True)

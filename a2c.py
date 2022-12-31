@@ -6,7 +6,7 @@ import time
 import cv2
 import gym
 import gym.wrappers
-import gym.envs.atari
+import ale_py.env.gym
 import numpy as np
 import torch
 from torch.utils import tensorboard
@@ -22,7 +22,7 @@ class ImshowWrapper(gym.ObservationWrapper):
         if self.count >= self.limit:
             self.count = 0
             cv2.imshow('', observation)  # TODO show it while the net trains. This will also allow to show multiple observations at a time and draw graphs of and critic loss, actions distribution on an image and state embedding
-            key = cv2.waitKey(1)
+            key = cv2.pollKey()
             if key != -1:
                 key = chr(key)
                 if '0' <= key <= '9':
@@ -39,7 +39,7 @@ class MetaRenderWrapper(gym.Wrapper):
         self.limit = 9 * 100
 
     def step(self, action):
-        observation, reward, done, diagnostic_info = super().step(action)
+        observation, reward, done, truncated, diagnostic_info = super().step(action)
         if self.count >= self.limit:
             self.count = 0
             cv2.imshow('', diagnostic_info['rgb'][:, :, ::-1])
@@ -50,7 +50,7 @@ class MetaRenderWrapper(gym.Wrapper):
                     self.limit = int(key) * 100
         else:
             self.count += 1
-        return observation, reward, done, diagnostic_info
+        return observation, reward, done, truncated, diagnostic_info
 
 
 class RenderWrapper(gym.Wrapper):
@@ -87,17 +87,17 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
         self.prev_lives = 5
 
     def step(self, action):
-        observation, reward, done, diagnostic_info = super().step(action)
+        observation, reward, done, truncated, diagnostic_info = super().step(action)
         if done:
             self.prev_lives = 5
-            return observation, reward, True, {None: False}
+            return observation, reward, True, truncated, {None: False}
         else:
             lives = diagnostic_info['lives']
             if lives < self.prev_lives:
                 self.prev_lives = lives
-                return observation, reward, False, {None: False}
+                return observation, reward, False, truncated, {None: False}
             else:
-                return observation, reward, False, {None: True}
+                return observation, reward, False, truncated, {None: True}
 
 
 class CountTimeLimit(gym.wrappers.TimeLimit):
@@ -112,7 +112,7 @@ class CountTimeLimit(gym.wrappers.TimeLimit):
         return super().reset(**kwargs)
 
     def close(self):
-        print(f'{self.longest_session = } ')
+        print(f'{self.longest_session = }')
         super().close()
 
 
@@ -121,26 +121,26 @@ class InvertDonesWrapper(gym.Wrapper):
         super().__init__(env)
 
     def step(self, action):
-        observation, reward, done, diagnostic_info = super().step(action)
+        observation, reward, done, truncated, diagnostic_info = super().step(action)
         if done:
-            return observation, reward, True, {None: False}
-        return observation, reward, False, {None: True}
+            return observation, reward, True, truncated, {None: False}
+        return observation, reward, False, truncated, {None: True}
 
 
 def imenv(show=False):
     envargs = {'game': 'space_invaders', 'mode': None, 'difficulty': None, 'obs_type': 'grayscale', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True, 'render_mode': None}
     if show:
-        return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(gym.envs.atari.AtariEnv(
+        return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(
             **envargs), max_episode_steps=50_000)))), 1)
-    return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(gym.envs.atari.AtariEnv(
+    return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(
         **envargs), max_episode_steps=50_000))), 1)
 
 
 def ramenv(show=False):
     envargs = {'game': 'breakout', 'mode': None, 'difficulty': None, 'obs_type': 'ram', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True}
     if show:
-        return StopScoreOnLifeLossWrapepr(MetaRenderWrapper(ScaleWrapper(CountTimeLimit(gym.envs.atari.AtariEnv(render_mode='rgb_array', **envargs), max_episode_steps=50_000))))
-    return StopScoreOnLifeLossWrapepr(ScaleWrapper(CountTimeLimit(gym.envs.atari.AtariEnv(**envargs), max_episode_steps=50_000)))
+        return StopScoreOnLifeLossWrapepr(MetaRenderWrapper(ScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(render_mode='rgb_array', **envargs), max_episode_steps=50_000))))
+    return StopScoreOnLifeLossWrapepr(ScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(**envargs), max_episode_steps=50_000)))
 
 
 def classicenv(show=False):
@@ -249,7 +249,7 @@ def randplay(envs):
     last_scores = []
     envs.reset()
     for step_id in itertools.count():
-        next_observations, rewards, dones, diagnostic_infos = envs.step(envs.action_space.sample())
+        next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(envs.action_space.sample())
 
         current_scores += rewards
         if dones.any():
@@ -268,7 +268,7 @@ def main():
     torch.backends.cudnn.benchmark = True
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
     # TODO try wrappers from stable-baselines3
-    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 39) as envs:
+    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 47) as envs:
         states, max_mean_score = randplay(envs)
         try:
             n_actions = envs.action_space[0].n
@@ -292,11 +292,11 @@ def main():
                 one_hot = torch.nn.functional.one_hot(actions, num_classes=n_actions)
                 if n_actions == 1:
                     # env needs an extra dim
-                    next_observations, rewards, dones, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
+                    next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
                 else:
-                    next_observations, rewards, dones, diagnostic_infos = envs.step(actions.cpu().numpy())
+                    next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(actions.cpu().numpy())
                 rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
-                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor([alive[None] for alive in diagnostic_infos])))
+                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(diagnostic_infos[None])))
                 next_states = torch.as_tensor(next_observations)
                 states = next_states
 

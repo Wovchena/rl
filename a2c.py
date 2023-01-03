@@ -43,7 +43,7 @@ class MetaRenderWrapper(gym.Wrapper):
         if self.count >= self.limit:
             self.count = 0
             cv2.imshow('', diagnostic_info['rgb'][:, :, ::-1])
-            key = cv2.waitKey(1)
+            key = cv2.pollKey()
             if key != -1:
                 key = chr(key)
                 if '0' <= key <= '9':

@@ -222,6 +222,7 @@ def train_step(mem, detached_next_values, actor_critic):
     gamma_lambda = gamma * 0.95  # TODO: try lambda 0.5
     actor_losses = []
     entropy_losses = []
+    entropys_to_report = []
     critic_losses = []
     gae = 0.0
     for distrs, mem_values, actions, rewards, inverted_dones in reversed(mem):
@@ -229,19 +230,22 @@ def train_step(mem, detached_next_values, actor_critic):
         delta = rewards + gamma * inverted_dones * detached_next_values - detached_values
         gae = delta + gamma_lambda * inverted_dones * gae
         actor_losses.append((distrs.log_prob(actions) * gae))  # TODO mean here or only globally after this loop
-        entropy_losses.append(distrs.entropy())  # TODO / deisrs.entropy().item() Adaptive Entropy Regularization from https://arxiv.org/pdf/2007.02529.pdf
+        entropy = distrs.entropy()
+        entropy_losses.append(entropy / entropy.detach())  # Adaptive entropy regularization from https://arxiv.org/pdf/2007.02529.pdf
+        entropys_to_report.append(entropy.detach())
         critic_losses.append(torch.nn.functional.mse_loss(mem_values, gae + detached_values, reduction='none'))
         detached_next_values = detached_values
 
     actor_loss = -20.0 * torch.stack(actor_losses).mean()
     entropy_loss = torch.stack(entropy_losses).mean()
-    critic_loss = 5.0 * torch.stack(critic_losses).mean()  # TODO: why not sum()
+    entropy_to_report = torch.stack(entropys_to_report).mean()
+    critic_loss = 5.0 * torch.stack(critic_losses).mean()
 
     actor_critic.optimizer.zero_grad(set_to_none=True)
     (actor_loss - entropy_loss + critic_loss).backward()
     torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.4)
     actor_critic.optimizer.step()
-    return actor_loss.detach().cpu().numpy(), entropy_loss.detach().cpu().numpy(), critic_loss.detach().cpu().numpy()  # TODO item() vs numpy()
+    return actor_loss.detach().cpu().numpy(), entropy_to_report.cpu().numpy(), critic_loss.detach().cpu().numpy()  # TODO item() vs numpy()
 
 
 def randplay(envs):

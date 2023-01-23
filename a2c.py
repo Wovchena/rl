@@ -207,6 +207,7 @@ class ActorCritic(torch.nn.Module):
         features = torch.cat([self.extractor(state), ax], dim=1)
         hn = self.lstm(features, hx)
         temporal = hn[0]
+        # TODO: Horizon-Aware Value Functions - https://arxiv.org/pdf/1802.10031.pdf
         if value_only:
             return self.critic(temporal).squeeze()
         else:
@@ -243,7 +244,7 @@ def train_step(mem, detached_next_values, actor_critic):
 
     actor_critic.optimizer.zero_grad(set_to_none=True)
     (actor_loss - entropy_loss + critic_loss).backward()
-    torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.4)
+    torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), 0.4)  # TODO: test such big gradients actually exist. This clip should keep policy changes relatively small
     actor_critic.optimizer.step()
     return actor_loss.detach().cpu().numpy(), entropy_to_report.cpu().numpy(), critic_loss.detach().cpu().numpy()  # TODO item() vs numpy()
 
@@ -268,6 +269,7 @@ def randplay(envs):
 def main():
     # TODO random search that cuts bad params in the beginning
     # TODO assume game continues when max_episode_steps is hit
+    # TODO: apply code level optimisations from https://arxiv.org/pdf/2005.12729.pdf - ATTRIBUTING SUCCESS IN PROXIMAL POLICY OPTIMIZATION. They are simple
     torch.autograd.set_detect_anomaly(False)
     torch.backends.cudnn.benchmark = True
     torch.set_default_tensor_type(torch.cuda.FloatTensor)

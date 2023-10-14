@@ -112,7 +112,7 @@ class CountTimeLimit(gym.wrappers.TimeLimit):
         return super().reset(**kwargs)
 
     def close(self):
-        print(f'{self.longest_session = }')
+        print(f'{self.longest_session = }')  # Use this value to adgust max_episode_steps
         super().close()
 
 
@@ -273,7 +273,7 @@ def main():
     torch.autograd.set_detect_anomaly(False)
     torch.backends.cudnn.benchmark = True
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
-    # TODO try wrappers from stable-baselines3
+    # TODO try wrappers from stable-baselines3, try EnvPool to speed up
     with gym.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 47) as envs:  # TODO try small number of envs: 4, 8
         states, max_mean_score = randplay(envs)
         try:

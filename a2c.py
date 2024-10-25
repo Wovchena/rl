@@ -4,15 +4,14 @@ import os
 import time
 
 import cv2
-import gym
-import gym.wrappers
-import ale_py.env.gym
+import gymnasium
+import ale_py
 import numpy as np
 import torch
 from torch.utils import tensorboard
 
 
-class ImshowWrapper(gym.ObservationWrapper):
+class ImshowWrapper(gymnasium.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.count = 0
@@ -32,7 +31,7 @@ class ImshowWrapper(gym.ObservationWrapper):
         return observation
 
 
-class MetaRenderWrapper(gym.Wrapper):
+class MetaRenderWrapper(gymnasium.Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.count = 0
@@ -53,35 +52,35 @@ class MetaRenderWrapper(gym.Wrapper):
         return observation, reward, done, truncated, diagnostic_info
 
 
-class RenderWrapper(gym.Wrapper):
+class RenderWrapper(gymnasium.Wrapper):
     def step(self, action):
         ret = super().step(action)
         super().render()
         return ret
 
 
-class CropScaleWrapper(gym.ObservationWrapper):
+class CropScaleWrapper(gymnasium.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.shape = (94, 147)
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=self.shape, dtype=np.float32)
+        self.observation_space = gymnasium.spaces.Box(low=0.0, high=1.0, shape=self.shape, dtype=np.float32)
 
     def observation(self, observation):
         # observation.shape is (210, 160)
         return observation[5:-17:2, 7:-6].astype(np.float32) / 255.0  # TODO without scale
 
 
-class ScaleWrapper(gym.ObservationWrapper):
+class ScaleWrapper(gymnasium.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         old = env.observation_space
-        self.observation_space = gym.spaces.Box(low=0.0, high=0.0, shape=old.shape, dtype=np.float32)
+        self.observation_space = gymnasium.spaces.Box(low=0.0, high=0.0, shape=old.shape, dtype=np.float32)
 
     def observation(self, observation):
         return observation.astype(np.float32) / 255.0
 
 
-class StopScoreOnLifeLossWrapepr(gym.Wrapper):
+class StopScoreOnLifeLossWrapepr(gymnasium.Wrapper):
     def __init__(self, env):
         super().__init__(env)
         self.prev_lives = 5
@@ -100,7 +99,7 @@ class StopScoreOnLifeLossWrapepr(gym.Wrapper):
                 return observation, reward, False, truncated, {None: True}
 
 
-class CountTimeLimit(gym.wrappers.TimeLimit):
+class CountTimeLimit(gymnasium.wrappers.TimeLimit):
     def __init__(self, env, max_episode_steps):
         super().__init__(env, max_episode_steps)
         self._elapsed_steps = 0
@@ -116,7 +115,7 @@ class CountTimeLimit(gym.wrappers.TimeLimit):
         super().close()
 
 
-class InvertDonesWrapper(gym.Wrapper):
+class InvertDonesWrapper(gymnasium.Wrapper):
     def __init__(self, env):
         super().__init__(env)
 
@@ -130,24 +129,24 @@ class InvertDonesWrapper(gym.Wrapper):
 def imenv(show=False):
     envargs = {'game': 'space_invaders', 'mode': None, 'difficulty': None, 'obs_type': 'grayscale', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True, 'render_mode': None}
     if show:
-        return gym.wrappers.FrameStack(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(
+        return gymnasium.wrappers.FrameStackObservation(ImshowWrapper(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(ale_py.AtariEnv(
             **envargs), max_episode_steps=50_000)))), 1)
-    return gym.wrappers.FrameStack(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(
+    return gymnasium.wrappers.FrameStackObservation(StopScoreOnLifeLossWrapepr(CropScaleWrapper(CountTimeLimit(ale_py.AtariEnv(
         **envargs), max_episode_steps=50_000))), 1)
 
 
 def ramenv(show=False):
     envargs = {'game': 'breakout', 'mode': None, 'difficulty': None, 'obs_type': 'ram', 'frameskip': 5, 'repeat_action_probability': 0.25, 'full_action_space': True}
     if show:
-        return StopScoreOnLifeLossWrapepr(MetaRenderWrapper(ScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(render_mode='rgb_array', **envargs), max_episode_steps=50_000))))
-    return StopScoreOnLifeLossWrapepr(ScaleWrapper(CountTimeLimit(ale_py.env.gym.AtariEnv(**envargs), max_episode_steps=50_000)))
+        return StopScoreOnLifeLossWrapepr(MetaRenderWrapper(ScaleWrapper(CountTimeLimit(ale_py.AtariEnv(render_mode='rgb_array', **envargs), max_episode_steps=50_000))))
+    return StopScoreOnLifeLossWrapepr(ScaleWrapper(CountTimeLimit(ale_py.AtariEnv(**envargs), max_episode_steps=50_000)))
 
 
 def classicenv(show=False):
     envname = 'CartPole-v1'
     if show:
-        return RenderWrapper(InvertDonesWrapper(gym.make(envname)))
-    return InvertDonesWrapper(gym.make(envname))
+        return RenderWrapper(InvertDonesWrapper(gymnasium.make(envname)))
+    return InvertDonesWrapper(gymnasium.make(envname))
 
 
 def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
@@ -272,74 +271,74 @@ def main():
     # TODO: apply code level optimisations from https://arxiv.org/pdf/2005.12729.pdf - ATTRIBUTING SUCCESS IN PROXIMAL POLICY OPTIMIZATION. They are simple
     torch.autograd.set_detect_anomaly(False)
     torch.backends.cudnn.benchmark = True
-    torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    # torch.set_default_tensor_type(torch.cuda.FloatTensor)
     # TODO try wrappers from stable-baselines3, try EnvPool to speed up
-    with gym.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 47) as envs:  # TODO try small number of envs: 4, 8
-        states, max_mean_score = randplay(envs)
-        try:
-            n_actions = envs.action_space[0].n
-        except AttributeError:
-            n_actions = 1
-        actor_critic = ActorCritic(envs.observation_space.shape[1], n_actions)
-        one_hot = torch.zeros([envs.num_envs, n_actions])
-        prev_h = torch.zeros([envs.num_envs, 513]), torch.zeros([envs.num_envs, 513])
+    envs = gymnasium.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 47)  # TODO try small number of envs: 4, 8
+    states, max_mean_score = randplay(envs)
+    try:
+        n_actions = envs.action_space[0].n
+    except AttributeError:
+        n_actions = 1
+    actor_critic = ActorCritic(envs.observation_space.shape[1], n_actions)
+    one_hot = torch.zeros([envs.num_envs, n_actions])
+    prev_h = torch.zeros([envs.num_envs, 513]), torch.zeros([envs.num_envs, 513])
 
-        current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
-        last_scores = []
-        weighted_losses = []
-        mem = []
-        summary_writer = None
-        t0 = time.perf_counter()
-        for step_id in itertools.count():
-            for _ in range(5):
-                distrs, values, prev_h = actor_critic(states, one_hot, prev_h)
-                actions = distrs.sample()
-                # one_hot = actions[:, None]  # For Pendulum-v1 with one continuous action
-                one_hot = torch.nn.functional.one_hot(actions, num_classes=n_actions)
-                if n_actions == 1:
-                    # env needs an extra dim
-                    next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
-                else:
-                    next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(actions.cpu().numpy())
-                rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
-                mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(diagnostic_infos[None])))
-                next_states = torch.as_tensor(next_observations)
-                states = next_states
+    current_scores = np.zeros((envs.num_envs,), dtype=np.float32)
+    last_scores = []
+    weighted_losses = []
+    mem = []
+    summary_writer = None
+    t0 = time.perf_counter()
+    for step_id in itertools.count():
+        for _ in range(5):
+            distrs, values, prev_h = actor_critic(states, one_hot, prev_h)
+            actions = distrs.sample()
+            # one_hot = actions[:, None]  # For Pendulum-v1 with one continuous action
+            one_hot = torch.nn.functional.one_hot(actions, num_classes=n_actions)
+            if n_actions == 1:
+                # env needs an extra dim
+                next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(actions[:, None].cpu().numpy())
+            else:
+                next_observations, rewards, dones, truncated, diagnostic_infos = envs.step(actions.cpu().numpy())
+            rewards = rewards.astype(np.float32)  # VectorEnv returns with default dtype which is np.float64
+            mem.append((distrs, values, actions, torch.as_tensor(rewards), torch.tensor(diagnostic_infos[None])))
+            next_states = torch.as_tensor(next_observations)
+            states = next_states
 
-                current_scores += rewards
-                if dones.any():
-                    one_hot[dones] = 0
-                    inverted_dones = torch.as_tensor((~dones)[:, None])
-                    prev_h = prev_h[0] * inverted_dones, prev_h[1] * inverted_dones  # Stop grad for completed envs
-                    last_scores.extend(current_scores[dones])
-                    current_scores[dones] = 0.0
-                    if len(last_scores) > 249:  # TODO Rerpot every 5 mins
-                        scores = np.mean(last_scores)
-                        mean_losses = np.mean(weighted_losses, axis=0)
-                        mins = round((time.perf_counter() - t0) / 60.0)
-                        hours, mins = divmod(mins, 60)
-                        if max_mean_score < scores:
-                            max_mean_score = scores
-                            color = '\33[36m'
-                        else:
-                            color = '\33[m'
-                        last_scores *= 0
-                        weighted_losses *= 0
-                        if summary_writer is None:
-                            summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime(f'{os.path.dirname(os.path.abspath(__file__))}/runs/%d%b%H-%M'))
-                        step_idk = round(step_id * 0.001)
-                        summary_writer.add_scalar('Score', scores, step_idk)
-                        summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_idk)
-                        summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_idk)
-                        summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_idk)  # TODO report distribution over actions
-                        print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:8,.1f} {mean_losses}')  # TODO tqdm  # TODO customize np print
+            current_scores += rewards
+            if dones.any():
+                one_hot[dones] = 0
+                inverted_dones = torch.as_tensor((~dones)[:, None])
+                prev_h = prev_h[0] * inverted_dones, prev_h[1] * inverted_dones  # Stop grad for completed envs
+                last_scores.extend(current_scores[dones])
+                current_scores[dones] = 0.0
+                if len(last_scores) > 249:  # TODO Rerpot every 5 mins
+                    scores = np.mean(last_scores)
+                    mean_losses = np.mean(weighted_losses, axis=0)
+                    mins = round((time.perf_counter() - t0) / 60.0)
+                    hours, mins = divmod(mins, 60)
+                    if max_mean_score < scores:
+                        max_mean_score = scores
+                        color = '\33[36m'
+                    else:
+                        color = '\33[m'
+                    last_scores *= 0
+                    weighted_losses *= 0
+                    if summary_writer is None:
+                        summary_writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime(f'{os.path.dirname(os.path.abspath(__file__))}/runs/%d%b%H-%M'))
+                    step_idk = round(step_id * 0.001)
+                    summary_writer.add_scalar('Score', scores, step_idk)
+                    summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_idk)
+                    summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_idk)
+                    summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_idk)  # TODO report distribution over actions
+                    print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:8,.1f} {mean_losses}')  # TODO tqdm  # TODO customize np print
 
-            with torch.no_grad():
-                detached_next_values = actor_critic(next_states, one_hot, prev_h, value_only=True)
-            weighted_loss = train_step(mem, detached_next_values, actor_critic)
-            prev_h = prev_h[0].detach(), prev_h[1].detach()
-            weighted_losses.append(weighted_loss)
-            mem *= 0
+        with torch.no_grad():
+            detached_next_values = actor_critic(next_states, one_hot, prev_h, value_only=True)
+        weighted_loss = train_step(mem, detached_next_values, actor_critic)
+        prev_h = prev_h[0].detach(), prev_h[1].detach()
+        weighted_losses.append(weighted_loss)
+        mem *= 0
 
 
 if __name__ == '__main__':

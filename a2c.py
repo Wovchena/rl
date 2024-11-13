@@ -271,7 +271,7 @@ def main():
     # TODO: apply code level optimisations from https://arxiv.org/pdf/2005.12729.pdf - ATTRIBUTING SUCCESS IN PROXIMAL POLICY OPTIMIZATION. They are simple
     torch.autograd.set_detect_anomaly(False)
     torch.backends.cudnn.benchmark = True
-    # torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    torch.set_default_tensor_type(torch.cuda.FloatTensor)
     # TODO try wrappers from stable-baselines3, try EnvPool to speed up
     envs = gymnasium.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 47)  # TODO try small number of envs: 4, 8
     states, max_mean_score = randplay(envs)

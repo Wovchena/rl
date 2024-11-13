@@ -1,4 +1,5 @@
 ale-py >= 0.8.0
 gymnasium[atari]
+opencv-python
 tensorboard >= 2.7.0
 torch >= 1.10.0

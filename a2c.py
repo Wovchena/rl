@@ -271,7 +271,7 @@ def main():
     # TODO: apply code level optimisations from https://arxiv.org/pdf/2005.12729.pdf - ATTRIBUTING SUCCESS IN PROXIMAL POLICY OPTIMIZATION. They are simple
     torch.autograd.set_detect_anomaly(False)
     torch.backends.cudnn.benchmark = True
-    torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    # torch.set_default_tensor_type(torch.cuda.FloatTensor)
     # TODO try wrappers from stable-baselines3, try EnvPool to speed up
     envs = gymnasium.vector.async_vector_env.AsyncVectorEnv((lambda: imenv(show=True),) + (imenv,) * 47)  # TODO try small number of envs: 4, 8
     states, max_mean_score = randplay(envs)
@@ -289,6 +289,7 @@ def main():
     mem = []
     summary_writer = None
     t0 = time.perf_counter()
+    prev_scores, prev_actor_loss, prev_entropy_loss, prev_critic_loss = max_mean_score, 0, 0, 0
     for step_id in itertools.count():
         for _ in range(5):
             distrs, values, prev_h = actor_critic(states, one_hot, prev_h)
@@ -317,6 +318,7 @@ def main():
                     mean_losses = np.mean(weighted_losses, axis=0)
                     mins = round((time.perf_counter() - t0) / 60.0)
                     hours, mins = divmod(mins, 60)
+                    days, hours = divmod(hours, 24)
                     if max_mean_score < scores:
                         max_mean_score = scores
                         color = '\33[36m'
@@ -331,7 +333,16 @@ def main():
                     summary_writer.add_scalar('Losses/Actor', mean_losses[0], step_idk)
                     summary_writer.add_scalar('Losses/Entropy', mean_losses[1], step_idk)
                     summary_writer.add_scalar('Losses/Critic', mean_losses[2], step_idk)  # TODO report distribution over actions
-                    print(f'{color}{step_idk:5,}k {hours:2}:{mins:2} {scores:8,.1f} {mean_losses}')  # TODO tqdm  # TODO customize np print
+                    red = '\033[0;31m'
+                    green = '\033[0;32m'
+                    no_color = '\033[0m'
+                    scores_color = red if scores <= prev_scores else green
+                    actor_color = green if mean_losses[0] < prev_actor_loss else red
+                    entropy_color = green if mean_losses[1] < prev_entropy_loss else red
+                    critic_color = green if mean_losses[2] < prev_critic_loss else red
+                    # TODO: tqdm
+                    print(f'{color}{step_idk:5,}k {days:2}d {hours:2}h {mins:2}m{no_color} {scores_color}scores={scores:8,.1f}{no_color} losses/{actor_color}actor={mean_losses[0]:6,.2f}{no_color} {entropy_color}entropy={mean_losses[1]:5,.3f}{no_color} {critic_color}critic={mean_losses[2]:6,.1f}{no_color}')
+                    prev_scores, prev_actor_loss, prev_entropy_loss, prev_critic_loss = scores, mean_losses[0], mean_losses[1], mean_losses[2]
 
         with torch.no_grad():
             detached_next_values = actor_critic(next_states, one_hot, prev_h, value_only=True)

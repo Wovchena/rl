@@ -97,7 +97,7 @@ class ReplayMemory(object):
         return self._curr_size
 
     def _assign(self, pos, exp):
-        self.state[pos] = exp.state
+        self.state[pos] = exp.state[0]
         self.reward[pos] = exp.reward
         self.action[pos] = exp.action
         self.isOver[pos] = exp.isOver
@@ -151,17 +151,16 @@ class EnvRunner(object):
             q_values = self.predictor(history)[0][0]  # this is the bottleneck
             act = np.argmax(q_values)
 
-        self._current_ob, reward, isOver, info = self.player.step(act)
+        self._current_ob, reward, isOver, _truncated, diagnostic_info = self.player.step(act)
         self._current_game_score.append(reward)
         self._current_episode.append(Experience(old_s, act, reward, isOver))
 
         if isOver:
             flush_experience = True
-            if 'ale.lives' in info:  # if running Atari, do something special
-                if info['ale.lives'] != 0:
-                    # only record score and flush experience
-                    # when a whole game is over (not when an episode is over)
-                    flush_experience = False
+            if diagnostic_info['lives'] != 0:
+                # only record score and flush experience
+                # when a whole game is over (not when an episode is over)
+                flush_experience = False
             self.player.reset()
 
             if flush_experience:

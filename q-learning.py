@@ -4,10 +4,10 @@ import random
 
 import cv2
 
-import gym
-import gym.envs.atari
-# import gym.envs.classic_control
-import gym.wrappers
+import ale_py
+import gymnasium
+# import gymnasium.envs.classic_control
+import gymnasium.wrappers
 
 import numpy as np
 
@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import tensorboardX
+from torch.utils import tensorboard
 
 import expreplay
 
@@ -81,11 +81,11 @@ class DQN(torch.nn.Module):
 
     def forward(self, state):
         c1 = self.conv3(self.conv2(self.conv1(state)))
-        fc1 = F.relu(self.linear1(c1.view(c1.shape[0], -1)))
+        fc1 = F.relu(self.linear1(c1.reshape(c1.shape[0], -1)))
         return self.linear2(fc1)
 
 
-class RenderWrapper(gym.Wrapper):
+class RenderWrapper(gymnasium.Wrapper):
     def step(self, action):
         observation, reward, done, diagnostic_info = super().step(action)
         # cv2.imshow("kek", observation[2])
@@ -94,33 +94,33 @@ class RenderWrapper(gym.Wrapper):
         return observation, reward, done, diagnostic_info
 
 
-class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
+class CropGrayScaleResizeWrapper(gymnasium.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.shape = (84, 75)
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=self.shape, dtype=np.uint8)
+        self.observation_space = gymnasium.spaces.Box(low=0, high=255, shape=self.shape, dtype=np.uint8)
 
     def observation(self, observation):
         return cv2.resize(cv2.cvtColor(observation[-180:, :160], cv2.COLOR_RGB2GRAY),
                           (75, 84), interpolation=cv2.INTER_AREA)
 
 
-class SqueezeWrapper(gym.ObservationWrapper):
+class SqueezeWrapper(gymnasium.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(4, 84, 75), dtype=np.uint8)
+        self.observation_space = gymnasium.spaces.Box(low=0, high=255, shape=(4, 84, 75), dtype=np.uint8)
 
     def observation(self, observation):
         return np.squeeze(observation, 3)
 
 
 def env_fn():
-    # return gym.wrappers.FlattenObservation(gym.wrappers.FrameStack(gym.wrappers.TimeLimit(gym.envs.classic_control.CartPoleEnv(), 1000), 3))
+    # return gymnasium.wrappers.FlattenObservation(gymnasium.wrappers.FrameStack(gymnasium.wrappers.TimeLimit(gymnasium.envs.classic_control.CartPoleEnv(), 1000), 3))
     return SqueezeWrapper(
-        gym.wrappers.FrameStack(
+        gymnasium.wrappers.FrameStack(
             CropGrayScaleResizeWrapper(
-                gym.wrappers.TimeLimit(
-                    gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25),
+                gymnasium.wrappers.TimeLimit(
+                    ale_py.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25),
                     60000),
             ),
             4)
@@ -157,8 +157,8 @@ def main():
             return action_state_value_func(
                 torch.tensor(np.moveaxis(history, 3, 1), dtype=torch.float32, device=DEVICE)).cpu()[None, :, :]
     exp_replay = expreplay.ExpReplay(predictor,
-                                     lambda: CropGrayScaleResizeWrapper(gym.wrappers.TimeLimit(
-                                         gym.envs.atari.AtariEnv('breakout', obs_type='image', frameskip=4,
+                                     lambda: CropGrayScaleResizeWrapper(gymnasium.wrappers.TimeLimit(
+                                         ale_py.AtariEnv('breakout', obs_type='rgb', frameskip=4,
                                                                  repeat_action_probability=0.25), 60000)),
                                      1,
                                      (84, 75),
@@ -171,10 +171,10 @@ def main():
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
     exp_replay.exploration = START_EPSILON
     experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
-    summary_writer = tensorboardX.SummaryWriter(experiment_name)
+    summary_writer = tensorboard.SummaryWriter(experiment_name)
     summary_writer.add_hparams({'b': BATCH_SIZE, 'startEps': START_EPSILON, 'minEps': MIN_EPSILON,
         'stopEpsDecayAt': STOP_EPSILON_DECAY_AT, 'gamma': GAMMA.item(), 'lr': LEARNING_RATE,
-        'memSize': REPLAY_MEMORY_SIZE}, {}, 'hparams')
+        'memSize': REPLAY_MEMORY_SIZE}, {}, run_name='hparams')
     for step_idx, (observations, actions, rewards, dones) in enumerate(exp_replay):
         observations = torch.tensor(np.moveaxis(observations, 3, 1), dtype=torch.float32, device=DEVICE)
         actions = torch.tensor(actions.astype(np.int64), dtype=torch.int64, device=DEVICE)

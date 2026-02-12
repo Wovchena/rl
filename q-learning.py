@@ -119,7 +119,7 @@ def env_fn():
         gymnasium.wrappers.FrameStack(
             CropGrayScaleResizeWrapper(
                 gymnasium.wrappers.TimeLimit(
-                    ale_py.AtariEnv('breakout', obs_type='image', frameskip=4, repeat_action_probability=0.25),
+                    ale_py.AtariEnv('breakout', obs_type='rgb', frameskip=4, repeat_action_probability=0.25),
                     60000),
             ),
             4)

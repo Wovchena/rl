@@ -157,7 +157,7 @@ class EnvRunner(object):
 
         if isOver:
             flush_experience = True
-            if diagnostic_info.get('lives') != 0:
+            if diagnostic_info['lives'] != 0:
                 # only record score and flush experience
                 # when a whole game is over (not when an episode is over)
                 flush_experience = False

@@ -1,5 +1,4 @@
 import datetime
-import itertools
 import random
 
 import cv2
@@ -166,7 +165,6 @@ def main():
                                      ENV_NUM, 4,
                                      state_dtype='uint8')
     exp_replay._before_train()
-    exp_replay._init_memory()
     optimizer = torch.optim.Adam(action_state_value_func.parameters(), lr=LEARNING_RATE)
     exp_replay.exploration = START_EPSILON
     experiment_name = datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M')
@@ -193,6 +191,7 @@ def main():
 
         if step_idx % 1000 == 0:
             mean, max = exp_replay.runner.reset_stats()
+            print(step_idx, mean, max, exp_replay.exploration)
             summary_writer.add_scalar('mean score', mean, step_idx)
             summary_writer.add_scalar('max score', max, step_idx)
             summary_writer.add_scalar('epsilon', exp_replay.exploration, step_idx)

@@ -310,24 +310,25 @@ class ExpReplay:
         self.mem = ReplayMemory(memory_size, state_shape, self.history_len, dtype=state_dtype)
 
     def _init_memory(self):
-        print("Populating replay memory with epsilon={} ...".format(self.exploration))
-
-        with tqdm.tqdm(total=self.init_memory_size) as pbar:
+        with tqdm.tqdm(
+            total=self.init_memory_size,
+            desc=f"Populating replay memory with epsilon={self.exploration}"
+        ) as progress_bar:
             while len(self.mem) < self.init_memory_size:
                 self.runner.step(self.exploration)
-                pbar.update()
+                progress_bar.update()
         self._init_memory_flag.set()
 
     # quickly fill the memory for debug
     def _fake_init_memory(self):
         from copy import deepcopy
-        with tqdm.tqdm(total=self.init_memory_size) as pbar:
+        with tqdm.tqdm(total=self.init_memory_size) as progress_bar:
             while len(self.mem) < 5:
                 self.runner.step(self.exploration)
-                pbar.update()
+                progress_bar.update()
             while len(self.mem) < self.init_memory_size:
                 self.mem.append(deepcopy(self.mem._hist[0]))
-                pbar.update()
+                progress_bar.update()
         self._init_memory_flag.set()
 
     def _debug_sample(self, sample):
